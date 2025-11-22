@@ -45,7 +45,12 @@ MODES = {
 }
 
 ATM_RANGE = 200          # strikes around spot
-ALERT_COOLDOWN = 60      # seconds between alerts per key per mode
+ALERT_COOLDOWN = 60      # seconds between normal alerts per key per mode
+
+# Super Spike thresholds
+SUPER_A = {"SPIKE": 30, "LOTS": 3}   # Option A
+SUPER_B = {"SPIKE": 50, "LOTS": 5}   # Option B
+SUPER_COOLDOWN = 60                  # seconds between super alerts per key
 
 # --------------------------------------------------
 # NSE SESSION (ONE SESSION SHARED)
@@ -178,7 +183,9 @@ def run_mode(mode_name: str, cfg: dict):
     prev_oi = {}
     prev_vol = {}
     last_alert = {}
-    last_sign = {}  # +1 buyer side, -1 writer side
+    last_sign = {}      # +1 buyer side, -1 writer side
+    last_super_a = {}   # cooldown for super spike A
+    last_super_b = {}   # cooldown for super spike B
 
     send(
         f"*{mode_name} MODE STARTED*  "
@@ -262,7 +269,55 @@ def run_mode(mode_name: str, cfg: dict):
                         now_time = time.time()
                         last_t = last_alert.get(key, 0)
 
-                        # -------- ENTRY / ADD ALERT --------
+                        # ---------------- SUPER SPIKE B (EXTREME) ----------------
+                        if spike >= SUPER_B["SPIKE"] and lots >= SUPER_B["LOTS"]:
+                            last_sb = last_super_b.get(key, 0)
+                            if now_time - last_sb > SUPER_COOLDOWN:
+                                side_text = "BUYERS AGGRESSIVE" if chg > 0 else "WRITERS DOMINATING"
+                                msg = f"""
+🚨🚨 *EXTREME SUPER SPIKE (TYPE B)* 🚨🚨
+*{symbol} {strike} {opt_type} ({pos})*
+Expiry: `{expiry}`
+
+OI Spike: `+{spike:.1f}%`
+Lots Added: `{lots}` LOTS
+Volume: `{vol}`
+LTP: `₹{ltp}`
+
+Side: *{side_text}*
+Reason: *Extreme OI explosion detected ❗*
+
+Time: `{now_ist().strftime('%H:%M:%S')}` IST
+-------------------------------------
+                                """.strip()
+                                send(msg)
+                                last_super_b[key] = now_time
+
+                        # ---------------- SUPER SPIKE A (STRONG) -----------------
+                        if spike >= SUPER_A["SPIKE"] and lots >= SUPER_A["LOTS"]:
+                            last_sa = last_super_a.get(key, 0)
+                            if now_time - last_sa > SUPER_COOLDOWN:
+                                side_text = "BUYERS AGGRESSIVE" if chg > 0 else "WRITERS ACTIVE"
+                                msg = f"""
+🔥🔥 *SUPER SPIKE ALERT (TYPE A)* 🔥🔥
+*{symbol} {strike} {opt_type} ({pos})*
+Expiry: `{expiry}`
+
+OI Spike: `+{spike:.1f}%`
+Lots Added: `{lots}` LOTS
+Volume: `{vol}`
+LTP: `₹{ltp}`
+
+Side: *{side_text}*
+Reason: *Massive OI spike + big lot entry*
+
+Time: `{now_ist().strftime('%H:%M:%S')}` IST
+-------------------------------------
+                                """.strip()
+                                send(msg)
+                                last_super_a[key] = now_time
+
+                        # ---------------- NORMAL ENTRY / ADD ALERT --------------
                         if (
                             base_ok
                             and sign != 0
@@ -296,7 +351,7 @@ Time: `{now_ist().strftime('%H:%M:%S')}` IST
                             send(msg)
                             last_alert[key] = now_time
 
-                        # -------- EXIT / REVERSAL ALERT ----
+                        # ---------------- EXIT / REVERSAL ALERT -----------------
                         if (
                             base_ok
                             and sign != 0
@@ -369,6 +424,34 @@ def daily_restart_loop():
 
 
 # --------------------------------------------------
+# MARKET OPEN / CLOSE ALERTS
+# --------------------------------------------------
+def market_alerts_loop():
+    sent_open_for = None   # date for which open was sent
+    sent_close_for = None  # date for which close was sent
+
+    while True:
+        now = now_ist()
+        t = now.time()
+        d = now.date()
+        weekday = now.weekday()
+
+        if weekday < 5:  # Mon–Fri
+            # Market open 9:15
+            if dtime(9, 15) <= t <= dtime(9, 16) and sent_open_for != d:
+                send("🌞 *Good Morning Kalpe Bhai!* \n\nMarket opened — OI Scanner is now *LIVE* 🔥")
+                sent_open_for = d
+                sent_close_for = None  # reset
+
+            # Market close 15:30
+            if dtime(15, 30) <= t <= dtime(15, 31) and sent_close_for != d:
+                send("🔻 *Market Closed* 🔻\n\nKalpe Bhai, Scanner stopped scanning.\nSee you tomorrow! 🙏")
+                sent_close_for = d
+
+        time.sleep(20)
+
+
+# --------------------------------------------------
 # MAIN
 # --------------------------------------------------
 def main():
@@ -385,7 +468,10 @@ def main():
     # 3) Daily restart watcher
     threading.Thread(target=daily_restart_loop, daemon=True).start()
 
-    # 4) Heartbeat – very light, just for logs
+    # 4) Market open/close alerts
+    threading.Thread(target=market_alerts_loop, daemon=True).start()
+
+    # 5) Heartbeat – very light, just for logs
     while True:
         print("Heartbeat", now_ist())
         time.sleep(60)
