@@ -5,9 +5,7 @@ from datetime import datetime, time as dtime
 import requests
 import pytz
 
-# --------------------------------------------------
-# SAFER TELEGRAM SETTINGS (use Railway Variables)
-# --------------------------------------------------
+# ================== TELEGRAM SETTINGS (Railway env) ==================
 # In Railway → Service → Variables, set:
 # TELEGRAM_TOKEN     = 8545053757:AAFm0Og3HsLbmznRgaswT32av718DNkSxnw
 # TELEGRAM_CHAT_IDS  = 530388484,5332055063
@@ -15,46 +13,26 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_IDS_RAW = os.environ.get("TELEGRAM_CHAT_IDS", "")
 CHAT_IDS = [c.strip() for c in CHAT_IDS_RAW.split(",") if c.strip()]
 
-# --------------------------------------------------
-# SYMBOLS & LOT SIZES
-# --------------------------------------------------
-ASSETS = {
-    "NIFTY": 75,
-    "BANKNIFTY": 35,
-    "FINNIFTY": 65,
-    "MIDCPNIFTY": 140,
-    "HDFCBANK": 550,
-    "RELIANCE": 500,
-    "ICICIBANK": 700,
-    "INFY": 400,
-    "TCS": 175,
-    "BHARTIARTL": 475,
-    "ITC": 1600,
-    "KOTAKBANK": 400,
-    "HINDUNILVR": 300,
-    "LT": 175,
-}
+# ================== NIFTY SETTINGS ==================
+NIFTY_SYMBOL = "NIFTY"
+NIFTY_LOT = 75
 
-# --------------------------------------------------
-# MODES
-# --------------------------------------------------
+# We still keep 3 modes, but only for NIFTY
 MODES = {
-    "AGGRESSIVE": {"OI": 6, "VOL": 50, "VOLM": 1.0, "LOTS": 1},
-    "MODERATE":   {"OI": 10, "VOL": 100, "VOLM": 1.2, "LOTS": 2},
-    "SAFE":       {"OI": 20, "VOL": 150, "VOLM": 1.5, "LOTS": 5},
+    "AGGRESSIVE": {"OI": 6, "VOL": 30, "LOTS": 1, "IVROC": 5},
+    "MODERATE":   {"OI": 10, "VOL": 60, "LOTS": 2, "IVROC": 8},
+    "SAFE":       {"OI": 14, "VOL": 100, "LOTS": 3, "IVROC": 10},
 }
 
-ATM_RANGE = 200          # strikes around spot
-ALERT_COOLDOWN = 60      # seconds between normal alerts per key per mode
+ATM_RANGE = 200              # strikes around spot
+ALERT_COOLDOWN = 60          # seconds between normal alerts per key per mode
 
-# Super Spike thresholds
-SUPER_A = {"SPIKE": 30, "LOTS": 3}   # Option A
-SUPER_B = {"SPIKE": 50, "LOTS": 5}   # Option B
-SUPER_COOLDOWN = 60                  # seconds between super alerts per key
+# Super Spike thresholds (Option C)
+SUPER_A = {"SPIKE": 30, "LOTS": 5, "IVROC": 15}   # strong move
+SUPER_B = {"SPIKE": 50, "LOTS": 10, "IVROC": 25}  # extreme move
+SUPER_COOLDOWN = 60                               # seconds per key
 
-# --------------------------------------------------
-# NSE SESSION (ONE SESSION SHARED)
-# --------------------------------------------------
+# ================== NSE SESSION (shared) ==================
 session = requests.Session()
 session.headers.update({
     "User-Agent": "Mozilla/5.0",
@@ -62,9 +40,7 @@ session.headers.update({
     "Accept": "application/json,text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 })
 
-# --------------------------------------------------
-# TIME HELPERS
-# --------------------------------------------------
+# ================== TIME HELPERS ==================
 IST_TZ = pytz.timezone("Asia/Kolkata")
 
 
@@ -74,7 +50,7 @@ def now_ist() -> datetime:
 
 def is_trading_day() -> bool:
     """Mon–Fri only."""
-    return now_ist().weekday() < 5  # 0 = Monday, 6 = Sunday
+    return now_ist().weekday() < 5  # 0=Mon, 6=Sun
 
 
 def is_market_time() -> bool:
@@ -86,13 +62,10 @@ def is_market_time() -> bool:
     return dtime(9, 15) <= t <= dtime(15, 30)
 
 
-# --------------------------------------------------
-# TELEGRAM SEND (WITH BASIC SAFETY)
-# --------------------------------------------------
+# ================== TELEGRAM HELPERS ==================
 def send(msg: str) -> None:
     if not TELEGRAM_TOKEN or not CHAT_IDS:
-        # no token or chats configured → avoid error flood
-        print("TELEGRAM NOT CONFIGURED. Message would be:", msg[:80], "...")
+        print("TELEGRAM NOT CONFIGURED. Message would be:", msg[:120].replace("\n", " "), "...")
         return
 
     for chat in CHAT_IDS:
@@ -103,39 +76,31 @@ def send(msg: str) -> None:
                 timeout=10,
             )
             if resp.status_code != 200:
-                print("Telegram error:", resp.text[:100])
+                print("Telegram error:", resp.text[:200])
         except Exception as e:
             print("Telegram send error:", e)
 
 
-# --------------------------------------------------
-# GLOBAL CACHE: OPTION CHAIN (ONE FETCH LOOP)
-# --------------------------------------------------
-latest_chain_lock = threading.Lock()
-latest_chain = {}  # symbol -> (data_list, spot, timestamp)
+# ================== GLOBAL OPTION DATA CACHE ==================
+latest_lock = threading.Lock()
+latest_nifty = None  # (data_list, spot, timestamp)
 
 
-def fetch_option_chain(symbol: str, is_index: bool):
-    url = f"https://www.nseindia.com/api/option-chain-{'indices' if is_index else 'equities'}?symbol={symbol}"
+def fetch_option_chain_nifty():
+    url = f"https://www.nseindia.com/api/option-chain-indices?symbol={NIFTY_SYMBOL}"
     r = session.get(url, timeout=15)
     r.raise_for_status()
     j = r.json()
-    spot = j.get("underlyingValue") or j.get("info", {}).get("lastPrice", 0)
-    if is_index:
-        data = j["records"]["data"]
-    else:
-        data = j["filtered"]["data"]
+    spot = j.get("records", {}).get("underlyingValue") or j.get("underlyingValue") or 0
+    data = j["records"]["data"]
     return data, round(spot or 0)
 
 
 def data_fetch_loop():
     """
-    Single loop that refreshes data for all symbols roughly every ~5 seconds,
-    only during market time on Mon–Fri.
-    Automatic backoff on errors.
+    Fetch NIFTY option chain roughly every ~5s during market.
     """
     backoff = 5
-    INDEX_SYMBOLS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"}
 
     while True:
         try:
@@ -149,23 +114,18 @@ def data_fetch_loop():
 
             start = time.time()
 
-            for symbol in ASSETS:
-                is_index = symbol in INDEX_SYMBOLS
-                try:
-                    data, spot = fetch_option_chain(symbol, is_index)
-                    with latest_chain_lock:
-                        latest_chain[symbol] = (data, spot, time.time())
-                    # tiny delay between calls so NSE is happy
-                    time.sleep(0.2)
-                except Exception as e:
-                    print(f"[FETCH] Error for {symbol}:", e)
-                    # light backoff for that symbol
-                    time.sleep(backoff)
+            try:
+                data, spot = fetch_option_chain_nifty()
+                with latest_lock:
+                    global latest_nifty
+                    latest_nifty = (data, spot, time.time())
+                # very short sleep so NSE is happy
+                time.sleep(0.5)
+            except Exception as e:
+                print("[FETCH] Error for NIFTY:", e)
+                time.sleep(backoff)
 
-            # one full round done → reset backoff smaller
-            backoff = max(5, backoff // 2)
-
-            # keep overall cycle around 5 seconds if possible
+            # keep loop around 5 seconds
             elapsed = time.time() - start
             sleep_extra = max(0, 5 - elapsed)
             time.sleep(sleep_extra)
@@ -176,20 +136,19 @@ def data_fetch_loop():
             time.sleep(backoff)
 
 
-# --------------------------------------------------
-# SCANNER PER MODE  (USES CACHED DATA ONLY)
-# --------------------------------------------------
+# ================== SCANNER PER MODE ==================
 def run_mode(mode_name: str, cfg: dict):
     prev_oi = {}
     prev_vol = {}
+    prev_iv = {}
     last_alert = {}
-    last_sign = {}      # +1 buyer side, -1 writer side
-    last_super_a = {}   # cooldown for super spike A
-    last_super_b = {}   # cooldown for super spike B
+    last_sign = {}      # +1 buyers, -1 writers
+    last_super_a = {}   # cooldown for super A
+    last_super_b = {}   # cooldown for super B
 
     send(
         f"*{mode_name} MODE STARTED*  "
-        f"OI ≥ {cfg['OI']}%, Min lots {cfg['LOTS']}"
+        f"OI ≥ {cfg['OI']}%, Min {cfg['LOTS']} lots, IV ROC ≥ {cfg['IVROC']}%"
     )
 
     while True:
@@ -199,200 +158,233 @@ def run_mode(mode_name: str, cfg: dict):
                 continue
 
             if not is_market_time():
-                # outside market hours → relax
                 time.sleep(30)
                 continue
 
-            # take a snapshot so we don't hold lock for long
-            with latest_chain_lock:
-                snapshot = dict(latest_chain)
+            with latest_lock:
+                snapshot = latest_nifty
 
+            if snapshot is None:
+                time.sleep(1)
+                continue
+
+            data, spot, ts = snapshot
             now_ts = time.time()
 
-            for symbol, lot_size in ASSETS.items():
-                if symbol not in snapshot:
+            # data stale?
+            if not data or spot == 0 or now_ts - ts > 20:
+                time.sleep(1)
+                continue
+
+            for row in data:
+                strike = row.get("strikePrice")
+                expiry = row.get("expiryDate", "NA")
+                if strike is None:
                     continue
 
-                data, spot, ts = snapshot[symbol]
-                # skip stale data
-                if not data or spot == 0 or now_ts - ts > 20:
+                if abs(strike - spot) > ATM_RANGE:
                     continue
 
-                for row in data:
-                    strike = row.get("strikePrice")
-                    expiry = row.get("expiryDate", "NA")
-
-                    if strike is None or abs(strike - spot) > ATM_RANGE:
+                for opt_type in ("CE", "PE"):
+                    o = row.get(opt_type)
+                    if not o:
                         continue
 
-                    for opt_type in ("CE", "PE"):
-                        o = row.get(opt_type)
-                        if not o:
-                            continue
+                    key = f"{mode_name}_{strike}_{opt_type}_{expiry}"
 
-                        key = f"{mode_name}_{symbol}_{strike}_{opt_type}_{expiry}"
+                    oi = o.get("openInterest", 0)
+                    vol = o.get("totalTradedVolume", 0)
+                    ltp = o.get("lastPrice", 0.0)
+                    chg_oi = o.get("changeinOpenInterest", 0)
+                    iv = o.get("impliedVolatility", 0.0) or 0.0
 
-                        oi = o.get("openInterest", 0)
-                        vol = o.get("totalTradedVolume", 0)
-                        ltp = o.get("lastPrice", 0.0)
-                        chg = o.get("changeinOpenInterest", 0)
+                    if key not in prev_oi:
+                        prev_oi[key] = oi
+                        prev_vol[key] = vol
+                        prev_iv[key] = iv
+                        last_sign[key] = 0
+                        continue
 
-                        if key not in prev_oi:
-                            prev_oi[key] = oi
-                            prev_vol[key] = vol
-                            last_sign[key] = 0
-                            continue
+                    old_oi = prev_oi[key]
+                    old_vol = prev_vol[key]
+                    old_iv = prev_iv[key]
 
-                        old_oi = prev_oi[key]
-                        old_vol = prev_vol[key]
+                    spike = ((oi - old_oi) / old_oi * 100) if old_oi > 0 else 0.0
+                    lots = abs(chg_oi) // NIFTY_LOT
 
-                        spike = ((oi - old_oi) / old_oi * 100) if old_oi > 0 else 0
-                        lots = abs(chg) // lot_size
+                    vol_threshold = max(cfg["VOL"], old_vol)
+                    vol_ok = vol >= vol_threshold
 
-                        vol_threshold = max(cfg["VOL"], old_vol * cfg["VOLM"])
-                        vol_ok = vol >= vol_threshold
-                        base_ok = (spike >= cfg["OI"] and lots >= cfg["LOTS"] and vol_ok)
+                    iv_roc = ((iv - old_iv) / old_iv * 100) if old_iv > 0 else 0.0
 
-                        sign = 1 if chg > 0 else -1 if chg < 0 else 0
+                    base_ok = (
+                        spike >= cfg["OI"]
+                        and lots >= cfg["LOTS"]
+                        and vol_ok
+                    )
 
-                        # ATM / ITM / OTM tag
-                        if abs(strike - spot) <= 60:
-                            pos = "ATM"
-                        else:
-                            if (opt_type == "CE" and strike < spot) or (
-                                opt_type == "PE" and strike > spot
-                            ):
-                                pos = "ITM"
-                            else:
-                                pos = "OTM"
+                    sign = 1 if chg_oi > 0 else -1 if chg_oi < 0 else 0
 
-                        now_time = time.time()
-                        last_t = last_alert.get(key, 0)
-
-                        # ---------------- SUPER SPIKE B (EXTREME) ----------------
-                        if spike >= SUPER_B["SPIKE"] and lots >= SUPER_B["LOTS"]:
-                            last_sb = last_super_b.get(key, 0)
-                            if now_time - last_sb > SUPER_COOLDOWN:
-                                side_text = "BUYERS AGGRESSIVE" if chg > 0 else "WRITERS DOMINATING"
-                                msg = f"""
-🚨🚨 *EXTREME SUPER SPIKE (TYPE B)* 🚨🚨
-*{symbol} {strike} {opt_type} ({pos})*
-Expiry: `{expiry}`
-
-OI Spike: `+{spike:.1f}%`
-Lots Added: `{lots}` LOTS
-Volume: `{vol}`
-LTP: `₹{ltp}`
-
-Side: *{side_text}*
-Reason: *Extreme OI explosion detected ❗*
-
-Time: `{now_ist().strftime('%H:%M:%S')}` IST
--------------------------------------
-                                """.strip()
-                                send(msg)
-                                last_super_b[key] = now_time
-
-                        # ---------------- SUPER SPIKE A (STRONG) -----------------
-                        if spike >= SUPER_A["SPIKE"] and lots >= SUPER_A["LOTS"]:
-                            last_sa = last_super_a.get(key, 0)
-                            if now_time - last_sa > SUPER_COOLDOWN:
-                                side_text = "BUYERS AGGRESSIVE" if chg > 0 else "WRITERS ACTIVE"
-                                msg = f"""
-🔥🔥 *SUPER SPIKE ALERT (TYPE A)* 🔥🔥
-*{symbol} {strike} {opt_type} ({pos})*
-Expiry: `{expiry}`
-
-OI Spike: `+{spike:.1f}%`
-Lots Added: `{lots}` LOTS
-Volume: `{vol}`
-LTP: `₹{ltp}`
-
-Side: *{side_text}*
-Reason: *Massive OI spike + big lot entry*
-
-Time: `{now_ist().strftime('%H:%M:%S')}` IST
--------------------------------------
-                                """.strip()
-                                send(msg)
-                                last_super_a[key] = now_time
-
-                        # ---------------- NORMAL ENTRY / ADD ALERT --------------
-                        if (
-                            base_ok
-                            and sign != 0
-                            and sign == last_sign.get(key, 0)
-                            and now_time - last_t > ALERT_COOLDOWN
+                    # ATM / ITM / OTM
+                    if abs(strike - spot) <= 60:
+                        pos = "ATM"
+                    else:
+                        if (opt_type == "CE" and strike < spot) or (
+                            opt_type == "PE" and strike > spot
                         ):
-                            action = "BUYER BOUGHT" if chg > 0 else "WRITER SOLD"
-                            if opt_type == "CE" and chg > 0:
-                                signal = "BUY CALL"
-                            elif opt_type == "PE" and chg > 0:
-                                signal = "BUY PUT"
-                            else:
-                                signal = "SHORT (WRITER ACTIVE)"
+                            pos = "ITM"
+                        else:
+                            pos = "OTM"
 
+                    now_time = time.time()
+                    last_t = last_alert.get(key, 0)
+
+                    # ---------- SUPER SPIKE TYPE B (EXTREME) ----------
+                    if (
+                        (spike >= SUPER_B["SPIKE"] and lots >= SUPER_B["LOTS"])
+                        or iv_roc >= SUPER_B["IVROC"]
+                    ):
+                        last_sb = last_super_b.get(key, 0)
+                        if now_time - last_sb > SUPER_COOLDOWN:
+                            side_text = (
+                                "BUYERS AGGRESSIVE" if chg_oi > 0 else "WRITERS DOMINATING"
+                            )
                             msg = f"""
-[{mode_name}] *{symbol} {strike} {opt_type} ({pos})*
+🚨🚨 *EXTREME SUPER SPIKE (TYPE B)* 🚨🚨
+*{NIFTY_SYMBOL} {strike} {opt_type} ({pos})*
 Expiry: `{expiry}`
 
-**{action} {lots} LOTS**
 OI Spike: `+{spike:.1f}%`
-Vol: `{vol}`
+Lots Added: `{lots}` LOTS
+Volume: `{vol}`
+IV: `{old_iv:.2f}% → {iv:.2f}%`
+IV ROC: `{iv_roc:+.1f}%`
 
-LTP: `₹{ltp}`
-Approx Exposure: `₹{round(lots * lot_size * ltp):,}`
-
-Signal: *{signal}* (Observation only)
+Side: *{side_text}*
+Reason: *Extreme OI / IV explosion detected ❗*
 
 Time: `{now_ist().strftime('%H:%M:%S')}` IST
                             """.strip()
-
                             send(msg)
-                            last_alert[key] = now_time
+                            last_super_b[key] = now_time
 
-                        # ---------------- EXIT / REVERSAL ALERT -----------------
-                        if (
-                            base_ok
-                            and sign != 0
-                            and last_sign.get(key, 0) != 0
-                            and sign != last_sign[key]
-                            and now_time - last_t > ALERT_COOLDOWN
-                        ):
-                            if sign > 0 and last_sign[key] < 0:
-                                exit_text = "WRITER EXITED / SHORT COVER"
-                                new_side = "BUYERS ACTIVE"
-                            elif sign < 0 and last_sign[key] > 0:
-                                exit_text = "BUYER EXITED / PROFIT BOOKING"
-                                new_side = "WRITERS ACTIVE"
-                            else:
-                                exit_text = "POSITION SHIFT"
-                                new_side = "POSITION CHANGED"
-
+                    # ---------- SUPER SPIKE TYPE A (STRONG) ----------
+                    if (
+                        (spike >= SUPER_A["SPIKE"] and lots >= SUPER_A["LOTS"])
+                        or iv_roc >= SUPER_A["IVROC"]
+                    ):
+                        last_sa = last_super_a.get(key, 0)
+                        if now_time - last_sa > SUPER_COOLDOWN:
+                            side_text = (
+                                "BUYERS AGGRESSIVE" if chg_oi > 0 else "WRITERS ACTIVE"
+                            )
                             msg = f"""
-[{mode_name}] *EXIT ALERT — {symbol} {strike} {opt_type} ({pos})*
+🔥🔥 *SUPER SPIKE ALERT (TYPE A)* 🔥🔥
+*{NIFTY_SYMBOL} {strike} {opt_type} ({pos})*
+Expiry: `{expiry}`
+
+OI Spike: `+{spike:.1f}%`
+Lots Added: `{lots}` LOTS
+Volume: `{vol}`
+IV: `{old_iv:.2f}% → {iv:.2f}%`
+IV ROC: `{iv_roc:+.1f}%`
+
+Side: *{side_text}*
+Reason: *Massive OI spike + IV expansion*
+
+Time: `{now_ist().strftime('%H:%M:%S')}` IST
+                            """.strip()
+                            send(msg)
+                            last_super_a[key] = now_time
+
+                    # ---------- TREND CONTINUATION SIGNAL ----------
+                    if (
+                        base_ok
+                        and sign != 0
+                        and iv_roc >= cfg["IVROC"]
+                        and now_time - last_t > ALERT_COOLDOWN
+                    ):
+                        if chg_oi > 0:
+                            # Writers adding
+                            if opt_type == "PE":
+                                direction = "TREND UP — BUY CALL SETUP"
+                                trade_signal = "BUY CALL (CE)"
+                            else:  # CE
+                                direction = "TREND DOWN — BUY PUT SETUP"
+                                trade_signal = "BUY PUT (PE)"
+                        else:
+                            # Writers exiting but IV still rising
+                            if opt_type == "CE":
+                                direction = "REVERSAL UP — BUY CALL SETUP"
+                                trade_signal = "BUY CALL (CE)"
+                            else:
+                                direction = "REVERSAL DOWN — BUY PUT SETUP"
+                                trade_signal = "BUY PUT (PE)"
+
+                        msg = f"""
+[{mode_name}] *{NIFTY_SYMBOL} {strike} {opt_type} ({pos})*
+Expiry: `{expiry}`
+
+**{direction}**
+OI Spike: `+{spike:.1f}%`
+Lots Added: `{lots}` LOTS
+Volume: `{vol}`
+IV: `{old_iv:.2f}% → {iv:.2f}%`
+IV ROC: `{iv_roc:+.1f}%`
+
+Signal: *{trade_signal}*  (Observation only)
+
+Time: `{now_ist().strftime('%H:%M:%S')}` IST
+                        """.strip()
+
+                        send(msg)
+                        last_alert[key] = now_time
+
+                    # ---------- EXIT / REVERSAL ALERT (IV ROC flip) ----------
+                    if (
+                        base_ok
+                        and sign != 0
+                        and last_sign.get(key, 0) != 0
+                        and sign != last_sign[key]
+                        and iv_roc <= -cfg["IVROC"]
+                        and now_time - last_t > ALERT_COOLDOWN
+                    ):
+                        if sign > 0 and last_sign[key] < 0:
+                            exit_text = "WRITER EXITED / SHORT COVER"
+                            new_side = "BUYERS ACTIVE"
+                        elif sign < 0 and last_sign[key] > 0:
+                            exit_text = "BUYER EXITED / PROFIT BOOKING"
+                            new_side = "WRITERS ACTIVE"
+                        else:
+                            exit_text = "POSITION SHIFT"
+                            new_side = "POSITION CHANGED"
+
+                        msg = f"""
+[{mode_name}] *EXIT / REVERSAL — {NIFTY_SYMBOL} {strike} {opt_type} ({pos})*
 Expiry: `{expiry}`
 
 **{exit_text}**
-OI Change: `{chg}`
-Spike: `+{spike:.1f}%`
+OI Change: `{chg_oi}`
+Spike: `{spike:+.1f}%`
 Lots change: `{lots}`
 
+IV ROC flipped to `{iv_roc:+.1f}%`
 New side: *{new_side}*
 
 LTP: `₹{ltp}`
 Time: `{now_ist().strftime('%H:%M:%S')}` IST
-                            """.strip()
+                        """.strip()
 
-                            send(msg)
-                            last_alert[key] = now_time
+                        send(msg)
+                        last_alert[key] = now_time
 
-                        prev_oi[key] = oi
-                        prev_vol[key] = vol
-                        if sign != 0:
-                            last_sign[key] = sign
+                    # update history
+                    prev_oi[key] = oi
+                    prev_vol[key] = vol
+                    prev_iv[key] = iv
+                    if sign != 0:
+                        last_sign[key] = sign
 
-            # small rest: this loop is only CPU, no HTTP
             time.sleep(1)
 
         except Exception as e:
@@ -400,35 +392,28 @@ Time: `{now_ist().strftime('%H:%M:%S')}` IST
             time.sleep(5)
 
 
-# --------------------------------------------------
-# DAILY RESTART LOOP (9:10 AM, ONLY MON–FRI)
-# --------------------------------------------------
+# ================== DAILY RESTART (9:10 AM) ==================
 def daily_restart_loop():
     last_restart_date = None
     while True:
         now = now_ist()
-        if now.weekday() < 5:  # only Mon–Fri
+        if now.weekday() < 5:  # Mon–Fri
             if now.time().hour == 9 and now.time().minute == 10:
                 if last_restart_date != now.date():
                     send("♻️ Restarting OI scanner for new trading day (9:10 AM IST).")
-                    # exit process → Railway restarts container
                     os._exit(0)
             else:
-                # reset flag after 09:11 so next day can restart
                 if last_restart_date != now.date() and now.time() > dtime(9, 11):
                     last_restart_date = now.date()
         else:
             last_restart_date = None
-
         time.sleep(30)
 
 
-# --------------------------------------------------
-# MARKET OPEN / CLOSE ALERTS
-# --------------------------------------------------
+# ================== MARKET OPEN / CLOSE ALERTS ==================
 def market_alerts_loop():
-    sent_open_for = None   # date for which open was sent
-    sent_close_for = None  # date for which close was sent
+    sent_open_for = None
+    sent_close_for = None
 
     while True:
         now = now_ist()
@@ -436,14 +421,12 @@ def market_alerts_loop():
         d = now.date()
         weekday = now.weekday()
 
-        if weekday < 5:  # Mon–Fri
-            # Market open 9:15
+        if weekday < 5:
             if dtime(9, 15) <= t <= dtime(9, 16) and sent_open_for != d:
                 send("🌞 *Good Morning Kalpe Bhai!* \n\nMarket opened — OI Scanner is now *LIVE* 🔥")
                 sent_open_for = d
-                sent_close_for = None  # reset
+                sent_close_for = None
 
-            # Market close 15:30
             if dtime(15, 30) <= t <= dtime(15, 31) and sent_close_for != d:
                 send("🔻 *Market Closed* 🔻\n\nKalpe Bhai, Scanner stopped scanning.\nSee you tomorrow! 🙏")
                 sent_close_for = d
@@ -451,27 +434,18 @@ def market_alerts_loop():
         time.sleep(20)
 
 
-# --------------------------------------------------
-# MAIN
-# --------------------------------------------------
+# ================== MAIN ==================
 def main():
-    send("🚀 *KALPE BHAI OI SCANNER LIVE ON RAILWAY* 🚀")
+    send("🚀 *KALPE BHAI NIFTY OI + IV + IV ROC SCANNER LIVE ON RAILWAY* 🚀")
 
-    # 1) Start shared data fetch loop (5s scheduler)
     threading.Thread(target=data_fetch_loop, daemon=True).start()
 
-    # 2) Start each mode as separate light thread (no HTTP inside)
     for mode_name, cfg in MODES.items():
-        t = threading.Thread(target=run_mode, args=(mode_name, cfg), daemon=True)
-        t.start()
+        threading.Thread(target=run_mode, args=(mode_name, cfg), daemon=True).start()
 
-    # 3) Daily restart watcher
     threading.Thread(target=daily_restart_loop, daemon=True).start()
-
-    # 4) Market open/close alerts
     threading.Thread(target=market_alerts_loop, daemon=True).start()
 
-    # 5) Heartbeat – very light, just for logs
     while True:
         print("Heartbeat", now_ist())
         time.sleep(60)
