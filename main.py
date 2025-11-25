@@ -34,10 +34,25 @@ SUPER_COOLDOWN = 60                               # seconds per key
 
 # ================== NSE SESSION (shared) ==================
 session = requests.Session()
+
+# Use the REAL headers you captured from DevTools (without cookies)
 session.headers.update({
-    "User-Agent": "Mozilla/5.0",
-    "Referer": "https://www.nseindia.com",
-    "Accept": "application/json,text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "authority": "www.nseindia.com",
+    "accept": "*/*",
+    "accept-encoding": "gzip, deflate, br, zstd",
+    "accept-language": "en-US,en;q=0.9,en-IN;q=0.8",
+    "referer": "https://www.nseindia.com/option-chain",
+    "sec-ch-ua": '"Chromium";v="142", "Microsoft Edge";v="142", "Not_A Brand";v="99"',
+    "sec-ch-ua-mobile": "?1",
+    "sec-ch-ua-platform": '"Android"',
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-origin",
+    "user-agent": (
+        "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/142.0.0.0 Mobile Safari/537.36 Edg/142.0.0.0"
+    ),
 })
 
 # ================== TIME HELPERS ==================
@@ -87,13 +102,46 @@ latest_nifty = None  # (data_list, spot, timestamp)
 
 
 def fetch_option_chain_nifty():
-    url = f"https://www.nseindia.com/api/option-chain-indices?symbol={NIFTY_SYMBOL}"
-    r = session.get(url, timeout=15)
-    r.raise_for_status()
-    j = r.json()
-    spot = j.get("records", {}).get("underlyingValue") or j.get("underlyingValue") or 0
-    data = j["records"]["data"]
-    return data, round(spot or 0)
+    """
+    Try new v3 API first, then fall back to old indices API.
+    Uses the same headers as your browser.
+    """
+    urls = [
+        f"https://www.nseindia.com/api/option-chain-v3?type=Indices&symbol={NIFTY_SYMBOL}",
+        f"https://www.nseindia.com/api/option-chain-indices?symbol={NIFTY_SYMBOL}",
+    ]
+    last_error = None
+
+    for url in urls:
+        try:
+            r = session.get(url, timeout=15)
+            r.raise_for_status()
+            j = r.json()
+
+            # v3 and old API both usually contain "records"
+            records = j.get("records") or j.get("filtered")
+            if not isinstance(records, dict):
+                raise ValueError("Unexpected JSON structure")
+
+            data = records.get("data")
+            if not data:
+                raise ValueError("No 'data' in records")
+
+            spot = (
+                records.get("underlyingValue")
+                or j.get("underlyingValue")
+                or 0
+            )
+
+            print(f"[FETCH] OK from {url}")
+            return data, round(spot or 0)
+
+        except Exception as e:
+            print(f"[FETCH] Error for URL {url}: {e}")
+            last_error = e
+
+    # If both URLs fail
+    raise last_error or RuntimeError("Could not fetch NIFTY option chain")
 
 
 def data_fetch_loop():
