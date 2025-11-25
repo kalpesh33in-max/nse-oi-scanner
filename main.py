@@ -100,11 +100,16 @@ def send(msg: str) -> None:
 latest_lock = threading.Lock()
 latest_nifty = None  # (data_list, spot, timestamp)
 
+# ================== BLOCK CONTROL (NEW) ==================
+blocked = False          # is NSE blocking us?
+last_block_time = 0.0    # timestamp of last block
+
 
 def fetch_option_chain_nifty():
     """
     Try new v3 API first, then fall back to old indices API.
     Uses the same headers as your browser.
+    Raises on error; block detection is handled in data_fetch_loop().
     """
     urls = [
         f"https://www.nseindia.com/api/option-chain-v3?type=Indices&symbol={NIFTY_SYMBOL}",
@@ -140,15 +145,16 @@ def fetch_option_chain_nifty():
             print(f"[FETCH] Error for URL {url}: {e}")
             last_error = e
 
-    # If both URLs fail
+    # If both URLs fail, bubble up the error
     raise last_error or RuntimeError("Could not fetch NIFTY option chain")
 
 
 def data_fetch_loop():
     """
-    Fetch NIFTY option chain roughly every ~5s during market.
+    Fetch NIFTY option chain roughly every ~30s during market,
+    with NSE block detection + auto recovery.
     """
-    backoff = 5
+    global latest_nifty, blocked, last_block_time
 
     while True:
         try:
@@ -160,28 +166,56 @@ def data_fetch_loop():
                 time.sleep(30)
                 continue
 
-            start = time.time()
+            # If currently blocked, wait until 5 minutes passed
+            if blocked:
+                elapsed = time.time() - last_block_time
+                if elapsed < 300:  # 5 minutes
+                    time.sleep(10)
+                    continue  # keep waiting
+                # 5 minutes over → try again (keep blocked=True; clear only if success)
 
             try:
                 data, spot = fetch_option_chain_nifty()
-                with latest_lock:
-                    global latest_nifty
-                    latest_nifty = (data, spot, time.time())
-                # very short sleep so NSE is happy
-                time.sleep(0.5)
             except Exception as e:
-                print("[FETCH] Error for NIFTY:", e)
-                time.sleep(backoff)
+                err = str(e)
+                print("[FETCH] Error for NIFTY:", err)
 
-            # keep loop around 5 seconds
-            elapsed = time.time() - start
-            sleep_extra = max(0, 5 - elapsed)
-            time.sleep(sleep_extra)
+                # Detect "block-like" errors by message
+                if any(token in err.lower() for token in [
+                    "403", "forbidden", "blocked", "too many requests", "429", "captcha"
+                ]):
+                    if not blocked:  # first time we see block
+                        blocked = True
+                        last_block_time = time.time()
+                        send(
+                            "🔴 *NSE BLOCKED / ERROR!*\n\n"
+                            f"Reason: `{err}`\n\n"
+                            "Scanner will pause for *5 minutes* and then auto-retry…"
+                        )
+                else:
+                    # non-block error → small backoff
+                    time.sleep(10)
+
+                # go to next loop iteration
+                continue
+
+            # If no exception, we got data
+            if data and spot:
+                with latest_lock:
+                    latest_nifty = (data, spot, time.time())
+
+                # If we were blocked before and now success → mark recovered
+                if blocked:
+                    send("🟢 *RECOVERED!* NSE API unlocked. Scanner running again 🔥")
+                    blocked = False
+                    last_block_time = 0.0
+
+            # Hit NSE every ~30 seconds (as requested)
+            time.sleep(30)
 
         except Exception as e:
             print("[FETCH LOOP] Fatal error:", e)
-            backoff = min(backoff * 2, 60)
-            time.sleep(backoff)
+            time.sleep(30)
 
 
 # ================== SCANNER PER MODE ==================
