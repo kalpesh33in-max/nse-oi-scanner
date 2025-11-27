@@ -6,7 +6,7 @@ import requests
 import pytz
 
 # ================== TELEGRAM SETTINGS (Railway env) ==================
-# In Railway → Service → Variables, set:
+# Railway → Service → Variables:
 # TELEGRAM_TOKEN     = 8545053757:AAFm0Og3HsLbmznRgaswT32av718DNkSxnw
 # TELEGRAM_CHAT_IDS  = 530388484,5332055063
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
@@ -17,18 +17,18 @@ CHAT_IDS = [c.strip() for c in CHAT_IDS_RAW.split(",") if c.strip()]
 NIFTY_SYMBOL = "NIFTY"
 NIFTY_LOT = 75
 
-# We still keep 3 modes, but only for NIFTY
+# 3 modes for the same NIFTY data
 MODES = {
-    "AGGRESSIVE": {"OI": 6, "VOL": 30, "LOTS": 1, "IVROC": 5},
-    "MODERATE":   {"OI": 10, "VOL": 60, "LOTS": 2, "IVROC": 8},
+    "AGGRESSIVE": {"OI": 6,  "VOL": 30,  "LOTS": 1, "IVROC": 5},
+    "MODERATE":   {"OI": 10, "VOL": 60,  "LOTS": 2, "IVROC": 8},
     "SAFE":       {"OI": 14, "VOL": 100, "LOTS": 3, "IVROC": 10},
 }
 
 ATM_RANGE = 200              # strikes around spot
 ALERT_COOLDOWN = 60          # seconds between normal alerts per key per mode
 
-# Super Spike thresholds (Option C)
-SUPER_A = {"SPIKE": 30, "LOTS": 5, "IVROC": 15}   # strong move
+# Super Spike thresholds
+SUPER_A = {"SPIKE": 30, "LOTS": 5,  "IVROC": 15}  # strong move
 SUPER_B = {"SPIKE": 50, "LOTS": 10, "IVROC": 25}  # extreme move
 SUPER_COOLDOWN = 60                               # seconds per key
 
@@ -100,7 +100,7 @@ def send(msg: str) -> None:
 latest_lock = threading.Lock()
 latest_nifty = None  # (data_list, spot, timestamp)
 
-# ================== BLOCK CONTROL (NEW) ==================
+# ================== BLOCK CONTROL ==================
 blocked = False          # is NSE blocking us?
 last_block_time = 0.0    # timestamp of last block
 
@@ -123,7 +123,6 @@ def fetch_option_chain_nifty():
             r.raise_for_status()
             j = r.json()
 
-            # v3 and old API both usually contain "records"
             records = j.get("records") or j.get("filtered")
             if not isinstance(records, dict):
                 raise ValueError("Unexpected JSON structure")
@@ -153,6 +152,7 @@ def data_fetch_loop():
     """
     Fetch NIFTY option chain roughly every ~30s during market,
     with NSE block detection + auto recovery.
+    Runs 24×7 (no daily restart).
     """
     global latest_nifty, blocked, last_block_time
 
@@ -474,24 +474,6 @@ Time: `{now_ist().strftime('%H:%M:%S')}` IST
             time.sleep(5)
 
 
-# ================== DAILY RESTART (9:10 AM) ==================
-def daily_restart_loop():
-    last_restart_date = None
-    while True:
-        now = now_ist()
-        if now.weekday() < 5:  # Mon–Fri
-            if now.time().hour == 9 and now.time().minute == 10:
-                if last_restart_date != now.date():
-                    send("♻️ Restarting OI scanner for new trading day (9:10 AM IST).")
-                    os._exit(0)
-            else:
-                if last_restart_date != now.date() and now.time() > dtime(9, 11):
-                    last_restart_date = now.date()
-        else:
-            last_restart_date = None
-        time.sleep(30)
-
-
 # ================== MARKET OPEN / CLOSE ALERTS ==================
 def market_alerts_loop():
     sent_open_for = None
@@ -518,16 +500,16 @@ def market_alerts_loop():
 
 # ================== MAIN ==================
 def main():
-    send("🚀 *KALPE BHAI NIFTY OI + IV + IV ROC SCANNER LIVE ON RAILWAY* 🚀")
+    send("🚀 *KALPE BHAI NIFTY OI + IV + IV ROC SCANNER LIVE ON RAILWAY (24×7 MODE)* 🚀")
 
     threading.Thread(target=data_fetch_loop, daemon=True).start()
 
     for mode_name, cfg in MODES.items():
         threading.Thread(target=run_mode, args=(mode_name, cfg), daemon=True).start()
 
-    threading.Thread(target=daily_restart_loop, daemon=True).start()
     threading.Thread(target=market_alerts_loop, daemon=True).start()
 
+    # Heartbeat for Railway logs
     while True:
         print("Heartbeat", now_ist())
         time.sleep(60)
@@ -535,3 +517,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
