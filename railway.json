@@ -1,0 +1,9 @@
+{
+  "build": {
+    "builder": "paketobuildpacks/builder:base"
+  },
+  "deploy": {
+    "startCommand": "python3 all_scanners_5_runner.py"
+  },
+  "variables": {}
+}
