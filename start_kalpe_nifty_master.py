@@ -498,8 +498,8 @@ def market_alerts_loop():
         time.sleep(20)
 
 
-# ================== MAIN ==================
-def main():
+# ================== MAIN SCANNER START FUNCTION ==================
+def start_kalpe_nifty_master():
     send("🚀 *KALPE BHAI NIFTY OI + IV + IV ROC SCANNER LIVE ON RAILWAY (24×7 MODE)* 🚀")
 
     threading.Thread(target=data_fetch_loop, daemon=True).start()
@@ -516,5 +516,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
-
+    # agar aap sirf is file ko run karoge to ye ek hi scanner chalega (jaise abhi chalta tha)
+    start_kalpe_nifty_master()
