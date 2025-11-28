@@ -5,5 +5,8 @@
   "deploy": {
     "startCommand": "python3 all_scanners_5_runner.py"
   },
-  "variables": {}
+  "secrets": {
+    "TELEGRAM_TOKEN": "TELEGRAM_TOKEN",
+    "TELEGRAM_CHAT_IDS": "TELEGRAM_CHAT_IDS"
+  }
 }
