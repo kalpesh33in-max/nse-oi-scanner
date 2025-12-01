@@ -1,14 +1,16 @@
-# ---- Python Base ----
-FROM python:3.10-slim
+# Dockerfile – Railway deploys this
 
-# ---- Work Directory ----
+FROM python:3.10
+
+# Work directory inside container
 WORKDIR /app
 
-# ---- Copy Project ----
+# Copy code
 COPY . .
 
-# ---- Install Requirements ----
+# Install dependencies
+# Make sure requirements.txt has: requests, pytz, etc.
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ---- Start the 5 Scanners ----
-CMD ["python3", "all_scanners_5_runner.py"]
+# Run the 5-scanner runner
+CMD ["python", "all_scanners_5_runner.py"]
