@@ -1,4 +1,5 @@
-# nifty_75lot_100plus_final.py → NEW LOT SIZE 75 | 100+ LOTS ONLY | PHOTO JESA LOOK
+# nifty_75lot_100plus_final_threadsafe.py
+# NEW LOT SIZE 75 | 100+ LOTS ONLY | PHOTO JESA LOOK
 
 import os, time, json, pytz, requests
 from datetime import datetime
@@ -7,46 +8,64 @@ TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("TELEGRAM_CHAT_IDS")
 
 def send(msg):
-    if not TOKEN or not CHAT: return
+    if not TOKEN or not CHAT:
+        print("TG OFF:", msg[:80])
+        return
     try:
-        requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-                     json={"chat_id": CHAT, "text": msg, "parse_mode": "HTML"})
-    except: pass
+        requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            json={"chat_id": CHAT, "text": msg, "parse_mode": "HTML"},
+            timeout=8,
+        )
+    except:
+        pass
 
 s = requests.Session()
-s.headers.update({"User-Agent": "Mozilla/5.0", "Referer": "https://www.nseindia.com/option-chain"})
+s.headers.update({
+    "User-Agent": "Mozilla/5.0",
+    "Referer": "https://www.nseindia.com/option-chain"
+})
 
 # NEW NIFTY LOT SIZE FROM DEC 2025
 LOT_SIZE = 75
-MIN_LOTS = 100                    # sirf 100+ lots blast pe alert
+MIN_LOTS = 100
 RANGE = 800
-FILE = "data/nifty_75.json"
+FILE = "data/nifty_75_100plus.json"  # different file to avoid clash with other Nifty scanner
+
 os.makedirs("data", exist_ok=True)
 
 prev, sent = {}, set()
 
-def load():
+def load_state():
     global prev, sent
     try:
         with open(FILE) as f:
             d = json.load(f)
             prev = d.get("prev", {})
             sent = set(d.get("sent", []))
-    except: pass
+    except:
+        prev, sent = {}, set()
 
-def save():
+def save_state():
     try:
         with open(FILE, "w") as f:
             json.dump({"prev": prev, "sent": list(sent)}, f)
-    except: pass
+    except:
+        pass
 
-def run():
+def scan_once():
+    global prev, sent
     try:
         s.get("https://www.nseindia.com", timeout=10)
-        r = s.get("https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY", timeout=15)
-        if r.status_code != 200: return
+        r = s.get(
+            "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY",
+            timeout=15
+        )
+        if r.status_code != 200:
+            return
         data = r.json()["records"]
-    except: return
+    except:
+        return
 
     spot = int(data["underlyingValue"])
     exp = datetime.strptime(data["expiryDates"][0], "%d-%b-%Y").strftime("%d-%b-%Y")
@@ -55,7 +74,8 @@ def run():
 
     for i in data["data"]:
         st = i["strikePrice"]
-        if abs(st - atm) > RANGE: continue
+        if abs(st - atm) > RANGE:
+            continue
 
         ce = i.get("CE", {})
         pe = i.get("PE", {})
@@ -69,7 +89,7 @@ def run():
 
         tag = "(ATM)" if abs(st - atm) <= 50 else "(ITM)" if st > atm else "(OTM)"
 
-        # Calculate IV ROC for both sides
+        # IV ROC
         ce_roc = pe_roc = 0.0
         key_ce = f"CE_{st}"
         key_pe = f"PE_{st}"
@@ -78,7 +98,7 @@ def run():
         if key_pe in prev and prev[key_pe]["iv"] > 0:
             pe_roc = round((pe_iv - prev[key_pe]["iv"]) / prev[key_pe]["iv"] * 100, 1)
 
-        # PE BLAST → Green Circle BULLISH
+        # PE BLAST → Green
         if key_pe in prev:
             lots_added = (pe_oi - prev[key_pe]["oi"]) // LOT_SIZE
             if lots_added >= MIN_LOTS and key_pe not in sent:
@@ -92,7 +112,7 @@ def run():
 <i>Time:</i> {datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S')}""")
                 sent.add(key_pe)
 
-        # CE BLAST → Red Circle BEARISH
+        # CE BLAST → Red
         if key_ce in prev:
             lots_added = (ce_oi - prev[key_ce]["oi"]) // LOT_SIZE
             if lots_added >= MIN_LOTS and key_ce not in sent:
@@ -106,21 +126,27 @@ def run():
 <i>Time:</i> {datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S')}""")
                 sent.add(key_ce)
 
-        # Update previous data
-        if ce: prev[key_ce] = {"oi": ce_oi, "iv": ce_iv}
-        if pe: prev[key_pe] = {"oi": pe_oi, "iv": pe_iv}
+        # Update state
+        if ce:
+            prev[key_ce] = {"oi": ce_oi, "iv": ce_iv}
+        if pe:
+            prev[key_pe] = {"oi": pe_oi, "iv": pe_iv}
 
     for a in alerts:
         send(a)
         time.sleep(1.8)
 
-    save()
+    save_state()
 
-# START
-load()
-send("Green Circle Red Circle NIFTY SCANNER LIVE (75 Lot Size Updated)\n100+ Lots Whale Blast Only | Dono Side IV ROC")
-while True:
-    h = datetime.now(pytz.timezone('Asia/Kolkata')).hour
-    if 9 <= h <= 15:
-        run()
-    time.sleep(38)
+# ------------- THREAD-SAFE RUNNER -------------
+
+def run_iv_roc_scanner():
+    """Use this in your 5-scanner runner."""
+    load_state()
+    send("Green Circle Red Circle NIFTY SCANNER LIVE (75 Lot) | 100+ Lots | IV ROC Enabled")
+
+    while True:
+        h = datetime.now(pytz.timezone("Asia/Kolkata")).hour
+        if 9 <= h <= 15:
+            scan_once()
+        time.sleep(38)
