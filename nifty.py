@@ -1,204 +1,118 @@
-# nifty.py → KALPE BHAI NIFTY OI SCANNER (FUNCTION VERSION FOR RAILWAY MULTI-SCANNER)
+# nifty_75_lot_final.py → NEW LOT SIZE 75 | 100+ LOTS BLAST ONLY | DEC 2025
 
-def run_nifty_scanner():
-    import os
-    import time
-    import threading
-    import requests
-    import pytz
-    from datetime import datetime, time as dtime
+import os, time, json, pytz, requests
+from datetime import datetime
 
-    # ================== CONFIG ==================
-    TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-    CHAT_IDS = [int(x.strip()) for x in os.environ.get("TELEGRAM_CHAT_IDS", "").split(",") if x.strip()]
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("TELEGRAM_CHAT_IDS")
 
-    NIFTY_LOT = 25
-    ATM_RANGE = 400
+def send(msg):
+    if not TOKEN or not CHAT_ID: return
+    requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                 json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML", "disable_web_page_preview": True})
 
-    MODES = {
-        "AGGRESSIVE": {"OI": 10, "LOTS": 4,  "IVROC": 8},
-        "MODERATE":   {"OI": 16, "LOTS": 8,  "IVROC": 13},
-        "SAFE":       {"OI": 25, "LOTS": 12, "IVROC": 20},
-    }
+s = requests.Session()
+s.headers.update({"User-Agent": "Mozilla/5.0", "Referer": "https://www.nseindia.com/option-chain"})
 
-    SUPER_A = {"SPIKE": 45, "LOTS": 15, "IVROC": 28}
-    SUPER_B = {"SPIKE": 80, "LOTS": 25, "IVROC": 45}
+LOT_SIZE = 75                    # ← NEW NIFTY LOT SIZE FROM DEC 2025
+MIN_LOTS = 100                   # sirf 100+ lots (7500 qty) blast pe alert
+FILE = "data/nifty_75.json"
+os.makedirs("data", exist_ok=True)
 
-    # ================== NSE SESSION ==================
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Referer": "https://www.nseindia.com/option-chain",
-        "Origin": "https://www.nseindia.com",
-        "X-Requested-With": "XMLHttpRequest",
-    })
+prev, sent = {}, set()
 
-    IST = pytz.timezone("Asia/Kolkata")
+def load():
+    global prev, sent
+    try:
+        with open(FILE) as f:
+            d = json.load(f)
+            prev = d.get("prev", {})
+            sent = set(d.get("sent", []))
+    except: pass
 
-    def now_ist():
-        return datetime.now(IST)
+def save():
+    try: json.dump({"prev": prev, "sent": list(sent)}, open(FILE,"w"))
+    except: pass
 
-    def market_open():
-        n = now_ist()
-        return n.weekday() < 5 and dtime(9, 15) <= n.time() <= dtime(15, 30)
+def run():
+    try:
+        s.get("https://www.nseindia.com", timeout=10)
+        r = s.get("https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY", timeout=15)
+        data = r.json()["records"]
+    except: return
 
-    # ================== TELEGRAM ==================
-    def send(msg):
-        if not TELEGRAM_TOKEN or not CHAT_IDS:
-            print("TG OFF →", msg.replace("\n"," ")[:120])
-            return
-        for cid in CHAT_IDS:
-            try:
-                requests.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                    json={"chat_id": cid, "text": msg, "parse_mode": "Markdown"},
-                    timeout=10
-                )
-            except:
-                pass
-        print("SENT →", msg.split("\n")[0])
+    spot = int(data["underlyingValue"])
+    exp = datetime.strptime(data["expiryDates"][0], "%d-%b-%Y").strftime("%d-%b-%Y")
+    atm = int(round(spot/50)*50)
+    alerts = []
 
-    # ================== DATA CACHE ==================
-    lock = threading.Lock()
-    latest = None
-    blocked = False
+    for item in data["data"]:
+        strike = item["strikePrice"]
+        if abs(strike - atm) > 800: continue
 
-    def refresh_nse():
-        try:
-            session.get("https://www.nseindia.com", timeout=10)
-        except:
-            pass
+        ce = item.get("CE", {})
+        pe = item.get("PE", {})
 
-    def fetch_data():
-        nonlocal latest, blocked
-        urls = [
-            "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY",
-            "https://www.nseindia.com/api/option-chain-v3?type=Indices&symbol=NIFTY"
-        ]
-        for url in urls:
-            try:
-                refresh_nse()
-                time.sleep(1.5)
-                r = session.get(url, timeout=20)
-                if r.status_code != 200:
-                    continue
-                j = r.json()
-                rec = j.get("records") or j.get("filtered") or {}
-                data = rec.get("data") or []
-                spot = rec.get("underlyingValue") or j.get("underlyingValue") or 0
-                if data and spot:
-                    with lock:
-                        latest = (data, round(spot), time.time())
-                    if blocked:
-                        send("NSE UNBLOCKED! Scanner FULL POWER ON!")
-                        blocked = False
-                    print(f"[OK] Spot {spot} | {len(data)} strikes | {now_ist().strftime('%H:%M:%S')}")
-                    return True
-            except Exception as e:
-                print(f"[FAIL] {e}")
-        if not blocked:
-            blocked = True
-            send("NSE BLOCKED! Retrying...")
-        return False
+        ce_oi = ce.get("openInterest",0) * LOT_SIZE
+        pe_oi = pe.get("openInterest",0) * LOT_SIZE
+        ce_ltp = ce.get("lastPrice",0)
+        pe_ltp = pe.get("lastPrice",0)
+        ce_iv = round(ce.get("impliedVolatility",0) or 0, 1)
+        pe_iv = round(pe.get("impliedVolatility",0) or 0, 1)
 
-    def fetch_loop():
-        while True:
-            if market_open():
-                fetch_data()
-                time.sleep(34)
-            else:
-                time.sleep(40)
+        tag = "(ATM)" if abs(strike-atm)<=50 else "(ITM)" if strike>atm else "(OTM)"
 
-    # ================== SCANNER ==================
-    def run_scanner(mode_name, cfg):
-        hist = {}
-        cooldown = {}
-        send(f"*{mode_name} MODE ACTIVATED*\nOI ≥ {cfg['OI']}%, ≥ {cfg['LOTS']} lots, IV ROC ≥ {cfg['IVROC']}%")
+        key_ce = f"CE_{strike}"
+        key_pe = f"PE_{strike}"
 
-        while True:
-            time.sleep(1)
-            if not market_open() or not latest:
-                continue
+        # IV ROC both sides
+        ce_roc = pe_roc = 0.0
+        if key_ce in prev and prev[key_ce]["iv"] > 0:
+            ce_roc = round((ce_iv - prev[key_ce]["iv"]) / prev[key_ce]["iv"] * 100, 1)
+        if key_pe in prev and prev[key_pe]["iv"] > 0:
+            pe_roc = round((pe_iv - prev[key_pe]["iv"]) / prev[key_pe]["iv"] * 100, 1)
 
-            data, spot, ts = latest
-            if time.time() - ts > 120:
-                continue
+        # PE BLAST → Green Circle
+        if key_pe in prev:
+            lots = (pe_oi - prev[key_pe]["oi"]) // LOT_SIZE
+            if lots >= MIN_LOTS and key_pe not in sent:
+                alerts.append(f"""Green Circle <b>NIFTY {int(strike)} {tag}</b> Green Circle
+{exp} │ Spot: <b>{spot}</b>
 
-            for row in data:
-                strike = row["strikePrice"]
-                if abs(strike - spot) > ATM_RANGE:
-                    continue
+<b>LTP CE:</b> {ce_ltp:.0f} │ <b>LTP PE:</b> {pe_ltp:.0f}
+<b>IV CE:</b> {ce_iv} (ROC <b>{ce_roc:+.1f}%</b>) │ <b>IV PE:</b> {pe_iv} (ROC <b>{pe_roc:+.1f}%</b>)
+<b>OI +{lots} Lots (PE)</b> → <b>BUYERS BLAST</b>
 
-                for typ in ("CE", "PE"):
-                    opt = row.get(typ)
-                    if not opt:
-                        continue
+<i>Time:</i> {datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S')}""")
+                sent.add(key_pe)
 
-                    key = f"{strike}_{typ}_{row['expiryDate']}"
-                    oi = opt["openInterest"]
-                    chg = opt["changeinOpenInterest"]
-                    vol = opt["totalTradedVolume"]
-                    iv = opt.get("impliedVolatility") or 0
-                    lots = abs(chg) // NIFTY_LOT
-                    sign = "BUYERS" if chg > 0 else "WRITERS" if chg < 0 else "NEUTRAL"
+        # CE BLAST → Red Circle
+        if key_ce in prev:
+            lots = (ce_oi - prev[key_ce]["oi"]) // LOT_SIZE
+            if lots >= MIN_LOTS and key_ce not in sent:
+                alerts.append(f"""Red Circle <b>NIFTY {int(strike)} {tag}</b> Red Circle
+{exp} │ Spot: <b>{spot}</b>
 
-                    if key not in hist:
-                        hist[key] = {"oi": oi, "iv": iv}
-                        continue
+<b>LTP CE:</b> {ce_ltp:.0f} │ <b>LTP PE:</b> {pe_ltp:.0f}
+<b>IV CE:</b> {ce_iv} (ROC <b>{ce_roc:+.1f}%</b>) │ <b>IV PE:</b> {pe_iv} (ROC <b>{pe_roc:+.1f}%</b>)
+<b>OI +{lots} Lots (CE)</b> → <b>WRITERS ACTIVE</b>
 
-                    old = hist[key]
-                    spike = (oi - old["oi"]) / old["oi"] * 100 if old["oi"] > 0 else 0
-                    iv_roc = (iv - old["iv"]) / old["iv"] * 100 if old["iv"] > 0 else 0
+<i>Time:</i> {datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S')}""")
+                sent.add(key_ce)
 
-                    now = time.time()
-                    if now - cooldown.get(key, 0) < 80:
-                        hist[key] = {"oi": oi, "iv": iv}
-                        continue
+        # Update prev
+        if ce: prev[key_ce] = {"oi": ce_oi, "iv": ce_iv}
+        if pe: prev[key_pe] = {"oi": pe_oi, "iv": pe_iv}
 
-                    # SUPER B
-                    if (spike >= SUPER_B["SPIKE"] or abs(iv_roc) >= SUPER_B["IVROC"]) and lots >= SUPER_B["LOTS"]:
-                        send(f"""
-EXTREME BLAST!!!
-*NIFTY {strike} {typ}* 
-OI +{spike:.1f}% | {lots} lots | IV ROC {iv_roc:+.1f}%
-Side: *{sign}*
-Time: {now_ist().strftime('%H:%M:%S')}
-                        """)
-                        cooldown[key] = now
+    for a in alerts[:4]:
+        send(a)
+        time.sleep(2)
+    save()
 
-                    # SUPER A
-                    elif (spike >= SUPER_A["SPIKE"] or abs(iv_roc) >= SUPER_A["IVROC"]) and lots >= SUPER_A["LOTS"]:
-                        send(f"""
-SUPER SPIKE!!!
-*NIFTY {strike} {typ}* → {lots} lots
-OI +{spike:.1f}% | IV ROC {iv_roc:+.1f}%
-Side: {sign} | {now_ist().strftime('%H:%M:%S')}
-                        """)
-                        cooldown[key] = now
-
-                    # NORMAL
-                    elif spike >= cfg["OI"] and lots >= cfg["LOTS"] and abs(iv_roc) >= cfg["IVROC"]:
-                        direction = "BULLISH" if (typ=="CE" and sign=="BUYERS") or (typ=="PE" and sign=="WRITERS") else "BEARISH"
-                        send(f"""
-[{mode_name}] *ALERT*
-*NIFTY {strike} {typ}* → {direction}
-+{spike:.1f}% OI | {lots} lots | IV ROC {iv_roc:+.1f}%
-Time: {now_ist().strftime('%H:%M:%S')}
-                        """)
-                        cooldown[key] = now
-
-                    hist[key] = {"oi": oi, "iv": iv}
-
-    # ================== MAIN WORKFLOW ==================
-    send("NIFTY SCANNER STARTED (FUNCTION MODE)")
-
-    threading.Thread(target=fetch_loop, daemon=True).start()
-
-    for mode, cfg in MODES.items():
-        threading.Thread(target=run_scanner, args=(mode, cfg), daemon=True).start()
-
-    # keep scanner alive
-    while True:
-        print("NIFTY SCANNER ALIVE →", now_ist())
-        time.sleep(60)
+load()
+send("NIFTY 75 LOT SIZE SCANNER LIVE (Dec 2025 Updated)\n100+ Lots Blast Only | Dono Side IV ROC")
+while True:
+    h = datetime.now(pytz.timezone('Asia/Kolkata')).hour
+    if 9 <= h <= 15:
+        run()
+    time.sleep(38)
