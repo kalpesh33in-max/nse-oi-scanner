@@ -1,14 +1,12 @@
 import os
 import time
 import threading
-from datetime import datetime, time as dtime
+from datetime import datetime, date as ddate, time as dtime, timedelta
+import calendar
 import requests
 import pytz
 
-# ================== TELEGRAM SETTINGS (Railway env) ==================
-# Railway → Service → Variables:
-# TELEGRAM_TOKEN     = 8545053757:AAFm0Og3HsLbmznRgaswT32av718DNkSxnw
-# TELEGRAM_CHAT_IDS  = 530388484,5332055063
+# ================== TELEGRAM SETTINGS ==================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_IDS_RAW = os.environ.get("TELEGRAM_CHAT_IDS", "")
 CHAT_IDS = [c.strip() for c in CHAT_IDS_RAW.split(",") if c.strip()]
@@ -17,25 +15,21 @@ CHAT_IDS = [c.strip() for c in CHAT_IDS_RAW.split(",") if c.strip()]
 NIFTY_SYMBOL = "NIFTY"
 NIFTY_LOT = 75
 
-# 3 modes for the same NIFTY data
-MODES = {
-    "AGGRESSIVE": {"OI": 6,  "VOL": 30,  "LOTS": 1, "IVROC": 5},
-    "MODERATE":   {"OI": 10, "VOL": 60,  "LOTS": 2, "IVROC": 8},
-    "SAFE":       {"OI": 14, "VOL": 100, "LOTS": 3, "IVROC": 10},
-}
+ATM_RANGE = 200
 
-ATM_RANGE = 200              # strikes around spot
-ALERT_COOLDOWN = 60          # seconds between normal alerts per key per mode
+# SUPER SPIKE LEVELS
+SUPER_A = {"SPIKE": 30, "LOTS": 5, "IVROC": 15}
+SUPER_B = {"SPIKE": 50, "LOTS": 10, "IVROC": 25}
+SUPER_COOLDOWN = 60
 
-# Super Spike thresholds
-SUPER_A = {"SPIKE": 30, "LOTS": 5,  "IVROC": 15}  # strong move
-SUPER_B = {"SPIKE": 50, "LOTS": 10, "IVROC": 25}  # extreme move
-SUPER_COOLDOWN = 60                               # seconds per key
+# REVERSAL LIMITS
+REVERSAL_MIN_IVROC = 10
+REVERSAL_MIN_LOTS = 3
+REVERSAL_COOLDOWN = 60
 
-# ================== NSE SESSION (shared) ==================
+# ================== NSE SESSION ==================
 session = requests.Session()
 
-# Use the REAL headers you captured from DevTools (without cookies)
 session.headers.update({
     "authority": "www.nseindia.com",
     "accept": "*/*",
@@ -58,65 +52,90 @@ session.headers.update({
 # ================== TIME HELPERS ==================
 IST_TZ = pytz.timezone("Asia/Kolkata")
 
-
 def now_ist() -> datetime:
     return datetime.now(IST_TZ)
 
+def is_trading_day():
+    return now_ist().weekday() < 5
 
-def is_trading_day() -> bool:
-    """Mon–Fri only."""
-    return now_ist().weekday() < 5  # 0=Mon, 6=Sun
-
-
-def is_market_time() -> bool:
-    """Between 9:15 and 15:30 IST on trading days."""
+def is_market_time():
     now = now_ist()
-    if now.weekday() >= 5:  # Sat/Sun
+    if now.weekday() >= 5:
         return False
     t = now.time()
     return dtime(9, 15) <= t <= dtime(15, 30)
 
-
-# ================== TELEGRAM HELPERS ==================
-def send(msg: str) -> None:
+# ================== TELEGRAM ==================
+def send(msg):
     if not TELEGRAM_TOKEN or not CHAT_IDS:
-        print("TELEGRAM NOT CONFIGURED. Message would be:", msg[:120].replace("\n", " "), "...")
+        print("TELEGRAM NOT CONFIGURED:", msg[:120])
         return
 
     for chat in CHAT_IDS:
         try:
-            resp = requests.post(
+            r = requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
                 json={"chat_id": chat, "text": msg, "parse_mode": "Markdown"},
                 timeout=10,
             )
-            if resp.status_code != 200:
-                print("Telegram error:", resp.text[:200])
+            if r.status_code != 200:
+                print("Telegram error:", r.text[:200])
         except Exception as e:
-            print("Telegram send error:", e)
+            print("TG ERROR:", e)
 
-
-# ================== GLOBAL OPTION DATA CACHE ==================
+# ================== GLOBAL DATA ==================
 latest_lock = threading.Lock()
-latest_nifty = None  # (data_list, spot, timestamp)
+latest_nifty = None
+latest_fut = None
 
-# ================== BLOCK CONTROL ==================
-blocked = False          # is NSE blocking us?
-last_block_time = 0.0    # timestamp of last block
+blocked = False
+last_block_time = 0.0
 
+# ================== EXPIRY HELPERS ==================
+def parse_expiry(s):
+    try:
+        return datetime.strptime(s, "%d-%b-%Y").date()
+    except:
+        return None
 
-def fetch_option_chain_nifty():
-    """
-    Try new v3 API first, then fall back to old indices API.
-    Uses the same headers as your browser.
-    Raises on error; block detection is handled in data_fetch_loop().
-    """
+def classify_expiry(exp_raw, all_expiries):
+    d = parse_expiry(exp_raw)
+    if not d:
+        return exp_raw, "EXPIRY"
+
+    disp = d.strftime("%d %b %Y").upper()
+
+    # sort expiries
+    try:
+        sorted_dates = sorted(parse_expiry(e) for e in all_expiries if parse_expiry(e))
+        idx = sorted_dates.index(d)
+    except:
+        idx = -1
+
+    # find monthly expiry: last Thursday
+    last_day = ddate(d.year, d.month, calendar.monthrange(d.year, d.month)[1])
+    offset = (last_day.weekday() - 3) % 7
+    last_thu = last_day - timedelta(days=offset)
+
+    if d == last_thu:
+        etype = "MONTHLY"
+    elif idx == 0:
+        etype = "WEEKLY"
+    elif idx == 1:
+        etype = "NEXT WEEK"
+    else:
+        etype = "FAR EXPIRY"
+
+    return disp, etype
+
+# ================== FETCH OPTIONS ==================
+def fetch_option_chain():
     urls = [
         f"https://www.nseindia.com/api/option-chain-v3?type=Indices&symbol={NIFTY_SYMBOL}",
-        f"https://www.nseindia.com/api/option-chain-indices?symbol={NIFTY_SYMBOL}",
+        f"https://www.nseindia.com/api/option-chain-indices?symbol={NIFTY_SYMBOL}"
     ]
-    last_error = None
 
+    last_error = None
     for url in urls:
         try:
             r = session.get(url, timeout=15)
@@ -124,397 +143,297 @@ def fetch_option_chain_nifty():
             j = r.json()
 
             records = j.get("records") or j.get("filtered")
-            if not isinstance(records, dict):
-                raise ValueError("Unexpected JSON structure")
-
             data = records.get("data")
-            if not data:
-                raise ValueError("No 'data' in records")
+            spot = records.get("underlyingValue") or 0
+            expiry_list = records.get("expiryDates")
 
-            spot = (
-                records.get("underlyingValue")
-                or j.get("underlyingValue")
-                or 0
-            )
+            if not data or not expiry_list:
+                raise ValueError("Invalid JSON structure")
 
-            print(f"[FETCH] OK from {url}")
-            return data, round(spot or 0)
+            return data, round(spot), expiry_list
 
         except Exception as e:
-            print(f"[FETCH] Error for URL {url}: {e}")
             last_error = e
+            print("[FETCH] ERROR:", e)
 
-    # If both URLs fail, bubble up the error
-    raise last_error or RuntimeError("Could not fetch NIFTY option chain")
+    raise last_error
 
+# ================== FETCH FUTURES ==================
+def fetch_futures():
+    url = f"https://www.nseindia.com/api/quote-derivative?symbol={NIFTY_SYMBOL}"
+    r = session.get(url, timeout=15)
+    r.raise_for_status()
+    j = r.json()
 
+    stocks = j.get("stocks") or []
+    futures = []
+
+    for item in stocks:
+        meta = item.get("metadata", {})
+        if "futures" in str(meta.get("instrumentType", "")).lower():
+            futures.append((
+                meta.get("expiryDate"),
+                meta.get("openInterest", 0),
+                meta.get("changeinOpenInterest", 0)
+            ))
+
+    if not futures:
+        return None
+
+    def _p(x):
+        try: return datetime.strptime(x, "%d-%b-%Y")
+        except: return datetime.max
+
+    futures.sort(key=lambda x: _p(x[0]))
+    exp, oi, chg = futures[0]
+    return exp, oi, chg
+
+# ================== FETCH LOOP ==================
 def data_fetch_loop():
-    """
-    Fetch NIFTY option chain roughly every ~30s during market,
-    with NSE block detection + auto recovery.
-    Runs 24×7 (no daily restart).
-    """
-    global latest_nifty, blocked, last_block_time
+    global latest_nifty, latest_fut, blocked, last_block_time
 
     while True:
         try:
-            if not is_trading_day():
-                time.sleep(60)
-                continue
+            if not is_trading_day(): time.sleep(60); continue
+            if not is_market_time(): time.sleep(30); continue
 
-            if not is_market_time():
-                time.sleep(30)
-                continue
-
-            # If currently blocked, wait until 5 minutes passed
             if blocked:
-                elapsed = time.time() - last_block_time
-                if elapsed < 300:  # 5 minutes
+                if time.time() - last_block_time < 300:
                     time.sleep(10)
-                    continue  # keep waiting
-                # 5 minutes over → try again (keep blocked=True; clear only if success)
+                    continue
 
             try:
-                data, spot = fetch_option_chain_nifty()
-            except Exception as e:
-                err = str(e)
-                print("[FETCH] Error for NIFTY:", err)
+                data, spot, exp_list = fetch_option_chain()
+                fut = None
+                try:
+                    fut = fetch_futures()
+                except Exception as fe:
+                    print("[FUTURES ERROR]", fe)
 
-                # Detect "block-like" errors by message
-                if any(token in err.lower() for token in [
-                    "403", "forbidden", "blocked", "too many requests", "429", "captcha"
-                ]):
-                    if not blocked:  # first time we see block
+            except Exception as e:
+                err = str(e).lower()
+                if any(x in err for x in ["403","forbidden","blocked","429","captcha"]):
+                    if not blocked:
                         blocked = True
                         last_block_time = time.time()
-                        send(
-                            "🔴 *NSE BLOCKED / ERROR!*\n\n"
-                            f"Reason: `{err}`\n\n"
-                            "Scanner will pause for *5 minutes* and then auto-retry…"
-                        )
+                        send("🔴 *NSE BLOCKED!*\nRetrying in 5 minutes…")
                 else:
-                    # non-block error → small backoff
                     time.sleep(10)
-
-                # go to next loop iteration
-                continue
-
-            # If no exception, we got data
-            if data and spot:
-                with latest_lock:
-                    latest_nifty = (data, spot, time.time())
-
-                # If we were blocked before and now success → mark recovered
-                if blocked:
-                    send("🟢 *RECOVERED!* NSE API unlocked. Scanner running again 🔥")
-                    blocked = False
-                    last_block_time = 0.0
-
-            # Hit NSE every ~30 seconds (as requested)
-            time.sleep(30)
-
-        except Exception as e:
-            print("[FETCH LOOP] Fatal error:", e)
-            time.sleep(30)
-
-
-# ================== SCANNER PER MODE ==================
-def run_mode(mode_name: str, cfg: dict):
-    prev_oi = {}
-    prev_vol = {}
-    prev_iv = {}
-    last_alert = {}
-    last_sign = {}      # +1 buyers, -1 writers
-    last_super_a = {}   # cooldown for super A
-    last_super_b = {}   # cooldown for super B
-
-    send(
-        f"*{mode_name} MODE STARTED*  "
-        f"OI ≥ {cfg['OI']}%, Min {cfg['LOTS']} lots, IV ROC ≥ {cfg['IVROC']}%"
-    )
-
-    while True:
-        try:
-            if not is_trading_day():
-                time.sleep(60)
-                continue
-
-            if not is_market_time():
-                time.sleep(30)
                 continue
 
             with latest_lock:
-                snapshot = latest_nifty
+                latest_nifty = (data, spot, exp_list, time.time())
+                if fut:
+                    latest_fut = (fut[1], fut[2], fut[0], time.time())
 
-            if snapshot is None:
+            if blocked:
+                send("🟢 *RECOVERED!* Scanner running again 🔥")
+                blocked = False
+                last_block_time = 0
+
+            time.sleep(30)
+
+        except Exception as e:
+            print("[LOOP ERROR]", e)
+            time.sleep(30)
+
+# ================== MASTER SCANNER ==================
+def run_master():
+    prev_oi = {}
+    prev_iv = {}
+    last_sign = {}
+    last_A = {}
+    last_B = {}
+    last_R = {}
+
+    send("🚀 *NIFTY MASTER SCANNER STARTED*\nSuper Spike + Extreme Spike + Reversal\nExpiry auto-detected.\nFutures OI included.")
+
+    while True:
+        try:
+            if not is_trading_day(): time.sleep(60); continue
+            if not is_market_time(): time.sleep(30); continue
+
+            with latest_lock:
+                snap = latest_nifty
+                fut = latest_fut
+
+            if not snap:
                 time.sleep(1)
                 continue
 
-            data, spot, ts = snapshot
-            now_ts = time.time()
-
-            # data stale?
-            if not data or spot == 0 or now_ts - ts > 20:
+            data, spot, exp_list, ts = snap
+            if time.time() - ts > 20:
                 time.sleep(1)
                 continue
+
+            fut_block = ""
+            if fut:
+                fut_oi, fut_chg, fut_exp, fut_ts = fut
+                if time.time() - fut_ts < 300:
+                    if fut_chg > 0: fut_side = "FUT LONGS ADDED"
+                    elif fut_chg < 0: fut_side = "FUT SHORTS ADDED"
+                    else: fut_side = "FUT OI FLAT"
+
+                    fut_block = (
+                        f"\n\n📌 *Futures OI*\n"
+                        f"Expiry: `{fut_exp}`\n"
+                        f"OI: `{fut_oi}` | Δ `{fut_chg}` (*{fut_side}*)"
+                    )
 
             for row in data:
                 strike = row.get("strikePrice")
-                expiry = row.get("expiryDate", "NA")
-                if strike is None:
-                    continue
+                exp_raw = row.get("expiryDate","NA")
+                if strike is None: continue
+                if abs(strike - spot) > ATM_RANGE: continue
 
-                if abs(strike - spot) > ATM_RANGE:
-                    continue
+                exp_disp, exp_type = classify_expiry(exp_raw, exp_list)
 
-                for opt_type in ("CE", "PE"):
-                    o = row.get(opt_type)
-                    if not o:
-                        continue
+                for t in ("CE","PE"):
+                    o = row.get(t)
+                    if not o: continue
 
-                    key = f"{mode_name}_{strike}_{opt_type}_{expiry}"
+                    key = f"{strike}_{t}_{exp_raw}"
 
-                    oi = o.get("openInterest", 0)
-                    vol = o.get("totalTradedVolume", 0)
-                    ltp = o.get("lastPrice", 0.0)
-                    chg_oi = o.get("changeinOpenInterest", 0)
-                    iv = o.get("impliedVolatility", 0.0) or 0.0
+                    oi = o.get("openInterest",0)
+                    chg_oi = o.get("changeinOpenInterest",0)
+                    iv = o.get("impliedVolatility",0.0) or 0.0
+                    ltp = o.get("lastPrice",0.0)
 
                     if key not in prev_oi:
                         prev_oi[key] = oi
-                        prev_vol[key] = vol
                         prev_iv[key] = iv
                         last_sign[key] = 0
                         continue
 
                     old_oi = prev_oi[key]
-                    old_vol = prev_vol[key]
                     old_iv = prev_iv[key]
 
-                    spike = ((oi - old_oi) / old_oi * 100) if old_oi > 0 else 0.0
-                    lots = abs(chg_oi) // NIFTY_LOT
+                    spike = ((oi-old_oi)/old_oi*100) if old_oi>0 else 0
+                    iv_roc = ((iv-old_iv)/old_iv*100) if old_iv>0 else 0
+                    lots = abs(chg_oi)//NIFTY_LOT
 
-                    vol_threshold = max(cfg["VOL"], old_vol)
-                    vol_ok = vol >= vol_threshold
+                    sign = 1 if chg_oi>0 else -1 if chg_oi<0 else 0
 
-                    iv_roc = ((iv - old_iv) / old_iv * 100) if old_iv > 0 else 0.0
+                    if abs(strike-spot)<=60: pos="ATM"
+                    elif (t=="CE" and strike<spot) or (t=="PE" and strike>spot): pos="ITM"
+                    else: pos="OTM"
 
-                    base_ok = (
-                        spike >= cfg["OI"]
-                        and lots >= cfg["LOTS"]
-                        and vol_ok
-                    )
+                    now = time.time()
 
-                    sign = 1 if chg_oi > 0 else -1 if chg_oi < 0 else 0
-
-                    # ATM / ITM / OTM
-                    if abs(strike - spot) <= 60:
-                        pos = "ATM"
-                    else:
-                        if (opt_type == "CE" and strike < spot) or (
-                            opt_type == "PE" and strike > spot
-                        ):
-                            pos = "ITM"
-                        else:
-                            pos = "OTM"
-
-                    now_time = time.time()
-                    last_t = last_alert.get(key, 0)
-
-                    # ---------- SUPER SPIKE TYPE B (EXTREME) ----------
-                    if (
-                        (spike >= SUPER_B["SPIKE"] and lots >= SUPER_B["LOTS"])
-                        or iv_roc >= SUPER_B["IVROC"]
-                    ):
-                        last_sb = last_super_b.get(key, 0)
-                        if now_time - last_sb > SUPER_COOLDOWN:
-                            side_text = (
-                                "BUYERS AGGRESSIVE" if chg_oi > 0 else "WRITERS DOMINATING"
-                            )
-                            msg = f"""
-🚨🚨 *EXTREME SUPER SPIKE (TYPE B)* 🚨🚨
-*{NIFTY_SYMBOL} {strike} {opt_type} ({pos})*
-Expiry: `{expiry}`
+                    # EXTREME SUPER SPIKE (TYPE B)
+                    if (spike>=SUPER_B["SPIKE"] and lots>=SUPER_B["LOTS"]) or iv_roc>=SUPER_B["IVROC"]:
+                        if now-last_B.get(key,0) > SUPER_COOLDOWN:
+                            side = "BUYERS AGGRESSIVE" if chg_oi>0 else "WRITERS DOMINATING"
+                            send(f"""
+👑 *EXTREME SUPER SPIKE (TYPE B)* 👑
+*{NIFTY_SYMBOL} {strike} {t} ({pos})*
+Expiry: `{exp_disp}` ({exp_type})
 
 OI Spike: `+{spike:.1f}%`
-Lots Added: `{lots}` LOTS
-Volume: `{vol}`
-IV: `{old_iv:.2f}% → {iv:.2f}%`
+Lots: `{lots}`
 IV ROC: `{iv_roc:+.1f}%`
 
-Side: *{side_text}*
-Reason: *Extreme OI / IV explosion detected ❗*
+Side: *{side}*{fut_block}
 
 Time: `{now_ist().strftime('%H:%M:%S')}` IST
-                            """.strip()
-                            send(msg)
-                            last_super_b[key] = now_time
+""")
+                            last_B[key]=now
 
-                    # ---------- SUPER SPIKE TYPE A (STRONG) ----------
-                    if (
-                        (spike >= SUPER_A["SPIKE"] and lots >= SUPER_A["LOTS"])
-                        or iv_roc >= SUPER_A["IVROC"]
-                    ):
-                        last_sa = last_super_a.get(key, 0)
-                        if now_time - last_sa > SUPER_COOLDOWN:
-                            side_text = (
-                                "BUYERS AGGRESSIVE" if chg_oi > 0 else "WRITERS ACTIVE"
-                            )
-                            msg = f"""
-🔥🔥 *SUPER SPIKE ALERT (TYPE A)* 🔥🔥
-*{NIFTY_SYMBOL} {strike} {opt_type} ({pos})*
-Expiry: `{expiry}`
+                    # SUPER SPIKE (TYPE A)
+                    if (spike>=SUPER_A["SPIKE"] and lots>=SUPER_A["LOTS"]) or iv_roc>=SUPER_A["IVROC"]:
+                        if now-last_A.get(key,0) > SUPER_COOLDOWN:
+                            side = "BUYERS AGGRESSIVE" if chg_oi>0 else "WRITERS ACTIVE"
+                            send(f"""
+🔥 *SUPER SPIKE (TYPE A)* 🔥
+*{NIFTY_SYMBOL} {strike} {t} ({pos})*
+Expiry: `{exp_disp}` ({exp_type})
 
 OI Spike: `+{spike:.1f}%`
-Lots Added: `{lots}` LOTS
-Volume: `{vol}`
-IV: `{old_iv:.2f}% → {iv:.2f}%`
+Lots: `{lots}`
 IV ROC: `{iv_roc:+.1f}%`
 
-Side: *{side_text}*
-Reason: *Massive OI spike + IV expansion*
+Side: *{side}*{fut_block}
 
 Time: `{now_ist().strftime('%H:%M:%S')}` IST
-                            """.strip()
-                            send(msg)
-                            last_super_a[key] = now_time
+""")
+                            last_A[key]=now
 
-                    # ---------- TREND CONTINUATION SIGNAL ----------
-                    if (
-                        base_ok
-                        and sign != 0
-                        and iv_roc >= cfg["IVROC"]
-                        and now_time - last_t > ALERT_COOLDOWN
-                    ):
-                        if chg_oi > 0:
-                            # Writers adding
-                            if opt_type == "PE":
-                                direction = "TREND UP — BUY CALL SETUP"
-                                trade_signal = "BUY CALL (CE)"
-                            else:  # CE
-                                direction = "TREND DOWN — BUY PUT SETUP"
-                                trade_signal = "BUY PUT (PE)"
-                        else:
-                            # Writers exiting but IV still rising
-                            if opt_type == "CE":
-                                direction = "REVERSAL UP — BUY CALL SETUP"
-                                trade_signal = "BUY CALL (CE)"
+                    # EXTREME REVERSAL
+                    if (sign!=0 and last_sign.get(key,0)!=0 and sign!=last_sign[key]
+                        and abs(iv_roc)>=REVERSAL_MIN_IVROC and lots>=REVERSAL_MIN_LOTS):
+                        if now-last_R.get(key,0)>REVERSAL_COOLDOWN:
+
+                            if last_sign[key]>0 and sign<0:
+                                old="BUYERS DOMINATING"
+                                new="WRITERS ACTIVE"
+                                reason="BUYER EXIT / PROFIT BOOKING"
                             else:
-                                direction = "REVERSAL DOWN — BUY PUT SETUP"
-                                trade_signal = "BUY PUT (PE)"
+                                old="WRITERS DOMINATING"
+                                new="BUYERS ACTIVE"
+                                reason="WRITER EXIT / SHORT COVER"
 
-                        msg = f"""
-[{mode_name}] *{NIFTY_SYMBOL} {strike} {opt_type} ({pos})*
-Expiry: `{expiry}`
+                            send(f"""
+🔄 *EXTREME REVERSAL ALERT*
+*{NIFTY_SYMBOL} {strike} {t} ({pos})*
+Expiry: `{exp_disp}` ({exp_type})
 
-**{direction}**
-OI Spike: `+{spike:.1f}%`
-Lots Added: `{lots}` LOTS
-Volume: `{vol}`
-IV: `{old_iv:.2f}% → {iv:.2f}%`
+Old Side: *{old}*
+New Side: *{new}*
+Reason: *{reason}*
+
+OI Δ: `{chg_oi}`
+Lots: `{lots}`
 IV ROC: `{iv_roc:+.1f}%`
-
-Signal: *{trade_signal}*  (Observation only)
+LTP: `₹{ltp}`{fut_block}
 
 Time: `{now_ist().strftime('%H:%M:%S')}` IST
-                        """.strip()
+""")
 
-                        send(msg)
-                        last_alert[key] = now_time
+                            last_R[key]=now
 
-                    # ---------- EXIT / REVERSAL ALERT (IV ROC flip) ----------
-                    if (
-                        base_ok
-                        and sign != 0
-                        and last_sign.get(key, 0) != 0
-                        and sign != last_sign[key]
-                        and iv_roc <= -cfg["IVROC"]
-                        and now_time - last_t > ALERT_COOLDOWN
-                    ):
-                        if sign > 0 and last_sign[key] < 0:
-                            exit_text = "WRITER EXITED / SHORT COVER"
-                            new_side = "BUYERS ACTIVE"
-                        elif sign < 0 and last_sign[key] > 0:
-                            exit_text = "BUYER EXITED / PROFIT BOOKING"
-                            new_side = "WRITERS ACTIVE"
-                        else:
-                            exit_text = "POSITION SHIFT"
-                            new_side = "POSITION CHANGED"
-
-                        msg = f"""
-[{mode_name}] *EXIT / REVERSAL — {NIFTY_SYMBOL} {strike} {opt_type} ({pos})*
-Expiry: `{expiry}`
-
-**{exit_text}**
-OI Change: `{chg_oi}`
-Spike: `{spike:+.1f}%`
-Lots change: `{lots}`
-
-IV ROC flipped to `{iv_roc:+.1f}%`
-New side: *{new_side}*
-
-LTP: `₹{ltp}`
-Time: `{now_ist().strftime('%H:%M:%S')}` IST
-                        """.strip()
-
-                        send(msg)
-                        last_alert[key] = now_time
-
-                    # update history
                     prev_oi[key] = oi
-                    prev_vol[key] = vol
                     prev_iv[key] = iv
-                    if sign != 0:
-                        last_sign[key] = sign
+                    if sign!=0:
+                        last_sign[key]=sign
 
             time.sleep(1)
 
         except Exception as e:
-            print(f"[{mode_name}] ERROR:", e)
+            print("[MASTER ERROR]", e)
             time.sleep(5)
 
-
-# ================== MARKET OPEN / CLOSE ALERTS ==================
+# ================== MARKET ALERTS ==================
 def market_alerts_loop():
-    sent_open_for = None
-    sent_close_for = None
+    sent_open = None
+    sent_close = None
 
     while True:
         now = now_ist()
-        t = now.time()
         d = now.date()
-        weekday = now.weekday()
+        t = now.time()
 
-        if weekday < 5:
-            if dtime(9, 15) <= t <= dtime(9, 16) and sent_open_for != d:
-                send("🌞 *Good Morning Kalpe Bhai!* \n\nMarket opened — OI Scanner is now *LIVE* 🔥")
-                sent_open_for = d
-                sent_close_for = None
+        if now.weekday()<5:
+            if dtime(9,15)<=t<=dtime(9,16) and sent_open!=d:
+                send("🌞 *Good Morning Kalpe Bhai!* Market LIVE 🔥")
+                sent_open=d
 
-            if dtime(15, 30) <= t <= dtime(15, 31) and sent_close_for != d:
-                send("🔻 *Market Closed* 🔻\n\nKalpe Bhai, Scanner stopped scanning.\nSee you tomorrow! 🙏")
-                sent_close_for = d
+            if dtime(15,30)<=t<=dtime(15,31) and sent_close!=d:
+                send("🔻 *Market Closed* Kalpe Bhai 🙏")
+                sent_close=d
 
         time.sleep(20)
 
-
-# ================== MAIN SCANNER START FUNCTION ==================
+# ================== START ==================
 def start_kalpe_nifty_master():
-    send("🚀 *KALPE BHAI NIFTY OI + IV + IV ROC SCANNER LIVE ON RAILWAY (24×7 MODE)* 🚀")
+    send("🚀 *KALPE BHAI MASTER SCANNER LIVE (24×7)* 🚀")
 
     threading.Thread(target=data_fetch_loop, daemon=True).start()
-
-    for mode_name, cfg in MODES.items():
-        threading.Thread(target=run_mode, args=(mode_name, cfg), daemon=True).start()
-
+    threading.Thread(target=run_master, daemon=True).start()
     threading.Thread(target=market_alerts_loop, daemon=True).start()
 
-    # Heartbeat for Railway logs
     while True:
         print("Heartbeat", now_ist())
         time.sleep(60)
 
-
 if __name__ == "__main__":
-    # agar aap sirf is file ko run karoge to ye ek hi scanner chalega (jaise abhi chalta tha)
     start_kalpe_nifty_master()
