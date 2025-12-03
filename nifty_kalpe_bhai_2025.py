@@ -3,10 +3,11 @@ import time
 import threading
 import requests
 import pytz
-from datetime import datetime, time as dtime
+from datetime import datetime, timedelta, time as dtime
 
 
 def run_kalpe_super_scanner():
+
     TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
     CHAT_IDS = [int(x.strip()) for x in os.environ.get("TELEGRAM_CHAT_IDS", "").split(",") if x.strip()]
 
@@ -29,7 +30,7 @@ def run_kalpe_super_scanner():
 
     def send(msg):
         if not TELEGRAM_TOKEN or not CHAT_IDS:
-            print("TG OFF (KALPE_2025):", msg.replace("\n", " ")[:140])
+            print("TG-OFF:", msg[:200])
             return
         for cid in CHAT_IDS:
             try:
@@ -39,167 +40,132 @@ def run_kalpe_super_scanner():
                     timeout=10
                 )
             except Exception as e:
-                print("[KALPE_2025 TG ERROR]", e)
+                print("TG ERROR:", e)
 
     def get_headers():
         agents = [
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X) Safari/605",
-            "Mozilla/5.0 (X11; Linux x86_64) Firefox/131",
-            "Mozilla/5.0 (Windows NT 10.0) Firefox/131"
+            "Mozilla/5.0 (X11; Linux x86_64) Firefox/131"
         ]
         return {
             "User-Agent": agents[int(time.time()) % len(agents)],
             "Accept": "*/*",
-            "Referer": "https://www.nseindia.com/option-chain"
+            "Referer": "https://www.nseindia.com"
         }
 
     def refresh_nse():
         try:
             session.headers.update(get_headers())
             session.get("https://www.nseindia.com", timeout=10)
-            time.sleep(1)
-        except Exception as e:
-            print("[KALPE_2025 REFRESH ERROR]", e)
+        except:
+            pass
 
     refresh_nse()
 
     latest = None
     latest_future = None
-
-    # block handling (aggressive fast retry)
     blocked = False
-    last_block_time = 0.0
-
+    last_block_time = 0
     lock = threading.Lock()
 
-    def fetch_future_data():
-        """Fetch NIFTY future OI + Price (no block logic, just best-effort)."""
+    # --------------------------
+    # AUTO FETCH NIFTY FUTURE MONTHLY
+    # --------------------------
+    def fetch_nifty_future_auto():
+        """Fetch the nearest MONTHLY expiry NIFTY future."""
         nonlocal latest_future
         try:
-            url = "https://www.nseindia.com/api/live-analysis-oi-spurts-underlyings?index=FUTIDX"
+            url = "https://www.nseindia.com/api/quote-derivative?symbol=NIFTY"
             session.headers.update(get_headers())
-            r = session.get(url, timeout=15)
+            r = session.get(url, timeout=10)
             if r.status_code != 200:
                 return False
 
             j = r.json()
-            for item in j.get("data", []):
-                if item.get("symbol") == "NIFTY":
-                    latest_future = {
-                        "oi": item.get("oi", 0),
-                        "prev_oi": item.get("prev_oi", 0),
-                        "price": item.get("ltp", 0),
-                        "prev_price": item.get("prev_ltp", 0),
-                    }
-                    return True
-        except Exception as e:
-            print("[KALPE_2025 FUTURE ERROR]", e)
-        return False
+            items = j.get("stocks", [])
+            futures = [x for x in items if x.get("instrumentType") == "FUTIDX"]
 
-    def fetch_data():
-        """
-        Fetch NIFTY option-chain.
+            if not futures:
+                return False
 
-        Aggressive fast retry logic:
-        - If blocked → no heavy requests for 60s (1 minute)
-        - Detect 403 / 429 / captcha / blocked
-        - Custom TG alert on block & recover
-        """
-        nonlocal latest, blocked, last_block_time
-
-        # Cooldown when blocked
-        if blocked and (time.time() - last_block_time) < 60:
-            return False
-
-        urls = [
-            "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY",
-            "https://www.nseindia.com/api/option-chain-v3?type=Indices&symbol=NIFTY",
-        ]
-
-        any_error_text = None
-
-        for url in urls:
-            try:
-                refresh_nse()
-                session.headers.update(get_headers())
-                r = session.get(url, timeout=15)
-                if r.status_code != 200:
-                    raise Exception(f"HTTP {r.status_code}")
-
-                j = r.json()
-                records = j.get("records") or j.get("filtered") or {}
-                data = records.get("data") or []
-                spot = round(records.get("underlyingValue") or 0)
-
-                if data and spot > 15000:
-                    with lock:
-                        latest = (data, spot, time.time())
-
-                    # if we were blocked earlier, send recovery
-                    if blocked:
-                        send(
-                            "🟢 *KALPE 2025 SUPER SCANNER RECOVERED*\n\n"
-                            "NSE option-chain unlocked — Super Spike scanner back online 🔥"
-                        )
-                        blocked = False
-                        last_block_time = 0.0
-
-                    print(f"[KALPE_2025] FETCH OK | NIFTY {spot} | {len(data)} rows")
-                    return True
-
-            except Exception as e:
-                err = str(e)
-                any_error_text = err
-                print(f"[KALPE_2025] FETCH ERROR from {url}: {err}")
-
-                # detect block-like errors
-                if any(t in err.lower() for t in ["403", "forbidden", "blocked", "429", "too many", "captcha"]):
-                    if not blocked:
-                        blocked = True
-                        last_block_time = time.time()
-                        send(
-                            "🔴 *KALPE 2025 SUPER SCANNER BLOCKED (NSE OPTION-CHAIN)*\n\n"
-                            f"Reason: `{err}`\n\n"
-                            "*Aggressive Fast Retry ON* → Will retry every 1 minute until recovered."
-                        )
-                    else:
-                        # refresh block timestamp to keep cooldown window sliding
-                        last_block_time = time.time()
-
-                # continue to the next URL
-
-        # If all URLs failed but no explicit block pattern, still mark as blocked (generic)
-        if not blocked and any_error_text:
-            blocked = True
-            last_block_time = time.time()
-            send(
-                "🔴 *KALPE 2025 SUPER SCANNER ERROR (NSE OPTION-CHAIN)*\n\n"
-                f"Reason: `{any_error_text}`\n\n"
-                "*Fast Retry* → Retrying every 1 minute."
+            # Sort all futures by expiry date
+            futures_sorted = sorted(
+                futures,
+                key=lambda x: datetime.strptime(x["expiryDate"], "%d-%b-%Y")
             )
 
-        return False
+            fut = futures_sorted[0]  # nearest monthly future
 
-    def fetch_loop():
-        while True:
-            if market_open():
-                fetch_data()
-                fetch_future_data()
-                time.sleep(30)
-            else:
-                time.sleep(60)
+            latest_future = {
+                "price": fut.get("lastPrice", 0),
+                "prev_price": fut.get("prevClose", 0),
+                "oi": fut.get("openInterest", 0),
+                "prev_oi": fut.get("openInterest", 0) - fut.get("changeinOpenInterest", 0),
+                "expiry": fut.get("expiryDate", "")
+            }
+            return True
 
+        except Exception as e:
+            print("[FUTURE ERROR]", e)
+            return False
+
+    # --------------------------
+    # OPTION EXPIRY LABEL FIXED LOGIC
+    # --------------------------
     def expiry_type(expiry, all_exp):
-        all_sorted = sorted(list(set(all_exp)))
-        if not all_sorted:
+        """Return Weekly / Next Weekly / Monthly."""
+        if not all_exp:
             return ""
-        if expiry == all_sorted[0]:
-            return "(Weekly)"
-        elif len(all_sorted) > 1 and expiry == all_sorted[1]:
-            return "(Next Weekly)"
-        return "(Monthly)"
 
+        # Unique sorted
+        unique_sorted = sorted(
+            set(all_exp),
+            key=lambda x: datetime.strptime(x, "%d-%b-%Y")
+        )
+
+        today = now_ist().date()
+
+        # Keep only expiries after today
+        valid = [
+            e for e in unique_sorted
+            if datetime.strptime(e, "%d-%b-%Y").date() >= today
+        ]
+
+        if not valid:
+            return ""
+
+        # Current & Next Weekly
+        current_week = valid[0]
+        next_week = valid[1] if len(valid) > 1 else None
+
+        # Monthly expiry = last Thursday of that month
+        def last_thursday(dt):
+            temp = datetime(dt.year, dt.month, 28)
+            while temp.month == dt.month:
+                temp += timedelta(days=1)
+            temp -= timedelta(days=1)
+            while temp.weekday() != 3:
+                temp -= timedelta(days=1)
+            return temp.strftime("%d-%b-%Y")
+
+        monthly = None
+        for e in valid:
+            dt = datetime.strptime(e, "%d-%b-%Y")
+            if e == last_thursday(dt):
+                monthly = e
+
+        if expiry == current_week:
+            return "(Weekly)"
+        if expiry == next_week:
+            return "(Next Weekly)"
+        if expiry == monthly:
+            return "(Monthly)"
+        return ""
+
+    # --------------------------
+    # OPTION TREND
+    # --------------------------
     def classify_option_trend(price_now, price_old, oi_now, oi_old):
         if oi_now > oi_old and price_now > price_old:
             return "Buyer Dominant (Price ↑ , OI ↑)"
@@ -211,6 +177,9 @@ def run_kalpe_super_scanner():
             return "Long Unwinding (Price ↓ , OI ↓)"
         return "Mixed"
 
+    # --------------------------
+    # FUTURE TREND
+    # --------------------------
     def classify_future_trend(f):
         if not f:
             return ("Unknown", "")
@@ -228,19 +197,106 @@ def run_kalpe_super_scanner():
             return ("Long Unwinding", "(Future Price ↓ , Future OI ↓)")
         return ("Unknown", "")
 
+    # --------------------------
+    # MARKET BIAS = CE/PE + FUTURE TREND
+    # --------------------------
+    def market_bias(opt_type, opt_trend, fut_trend):
+        future_buy = fut_trend in ["Long Build-up", "Short Cover"]
+        future_sell = fut_trend in ["Short Build-up", "Long Unwinding"]
+
+        # CALL logic
+        if opt_type == "CE":
+            if future_sell:
+                return "Bearish", "CALL Writing + Future SELL → Bearish"
+            if future_buy:
+                return "Weak Bullish", "CALL Buying + Future BUY → Trap / Reversal"
+
+        # PUT logic
+        if opt_type == "PE":
+            if future_buy:
+                return "Strong Bearish", "PUT Buying + Future SELL → Strong Downtrend"
+            if future_sell:
+                return "Bullish", "PUT Writing + Future BUY → Uptrend strong"
+
+        return "Neutral", "No clear bias"
+
+    # --------------------------
+    # FETCH LOOP
+    # --------------------------
+    def fetch_loop():
+        while True:
+            if market_open():
+                fetch_data()
+                fetch_nifty_future_auto()
+                time.sleep(30)
+            else:
+                time.sleep(60)
+    # --------------------------
+    # FETCH OPTION-CHAIN
+    # --------------------------
+    def fetch_data():
+        nonlocal latest, blocked, last_block_time
+
+        if blocked and (time.time() - last_block_time) < 60:
+            return False
+
+        urls = [
+            "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY",
+            "https://www.nseindia.com/api/option-chain-v3?type=Indices&symbol=NIFTY"
+        ]
+
+        for url in urls:
+            try:
+                refresh_nse()
+                session.headers.update(get_headers())
+                r = session.get(url, timeout=10)
+                if r.status_code != 200:
+                    raise Exception(f"HTTP {r.status_code}")
+
+                j = r.json()
+                records = j.get("records") or j.get("filtered") or {}
+                data = records.get("data") or []
+                spot = round(records.get("underlyingValue") or 0)
+
+                if data and spot > 15000:
+                    with lock:
+                        latest = (data, spot, time.time())
+
+                    if blocked:
+                        send("🟢 *NSE Unblocked — Scanner Resumed*")
+                        blocked = False
+                        last_block_time = 0
+                    return True
+
+            except Exception as e:
+                err = str(e).lower()
+                print("FETCH ERROR:", e)
+
+                if any(t in err for t in ["403", "429", "blocked", "captcha"]):
+                    if not blocked:
+                        blocked = True
+                        last_block_time = time.time()
+                        send("🔴 *Scanner Blocked — Retrying every 1 min*")
+                    else:
+                        last_block_time = time.time()
+
+        return False
+
+    # --------------------------
+    # SUPER SCANNER MAIN LOGIC
+    # --------------------------
     def super_scanner():
         hist = {}
         cooldown = {}
-
-        send("⚡ *SUPER-SPIKE SCANNER ACTIVE* (Full Details + Future Trend Enabled)")
+        send("⚡ *SUPER-SPIKE SCANNER ACTIVE*")
 
         while True:
             time.sleep(1)
+
             if not market_open() or not latest:
                 continue
 
             data, spot, ts = latest
-
             if time.time() - ts > 120:
                 continue
 
@@ -252,6 +308,8 @@ def run_kalpe_super_scanner():
 
                 if abs(strike - spot) > ATM_RANGE:
                     continue
+
+                label = expiry_type(expiry, expiries)
 
                 for typ in ("CE", "PE"):
                     opt = row.get(typ)
@@ -266,21 +324,16 @@ def run_kalpe_super_scanner():
                     iv = opt.get("impliedVolatility") or 0
                     price = opt.get("lastPrice") or opt.get("bidprice") or 0
 
-                    spike = 0.0
-                    ivroc = 0.0
-
-                    if key in hist:
-                        p_old = hist[key]["price"]
-                        oi_old = hist[key]["oi"]
-                        iv_old = hist[key]["iv"]
-
-                        if oi_old > 0:
-                            spike = ((oi - oi_old) / oi_old) * 100
-                        if iv_old > 0:
-                            ivroc = ((iv - iv_old) / iv_old) * 100
-                    else:
+                    if key not in hist:
                         hist[key] = {"oi": oi, "iv": iv, "price": price}
                         continue
+
+                    oi_old = hist[key]["oi"]
+                    price_old = hist[key]["price"]
+                    iv_old = hist[key]["iv"]
+
+                    spike = ((oi - oi_old) / oi_old * 100) if oi_old else 0
+                    ivroc = ((iv - iv_old) / iv_old * 100) if iv_old else 0
 
                     now_t = time.time()
                     if now_t - cooldown.get(key, 0) < COOLDOWN_SEC:
@@ -295,27 +348,25 @@ def run_kalpe_super_scanner():
 
                     if trigger:
                         f_trend, f_msg = classify_future_trend(latest_future)
+                        opt_trend = classify_option_trend(price, price_old, oi, oi_old)
+                        bias, reason = market_bias(typ, opt_trend, f_trend)
 
-                        opt_trend = classify_option_trend(
-                            price, hist[key]["price"], oi, hist[key]["oi"]
-                        )
+                        fut_price = latest_future["price"]
+                        fut_oi = latest_future["oi"]
+                        fut_doi = fut_oi - latest_future["prev_oi"]
+                        fut_pc = latest_future["expiry"]
 
                         msg = (
-                            f"{trigger}\n"
-                            f"*Spot:* {spot}\n"
-                            f"*Strike:* {strike} {typ}\n"
-                            f"*Expiry:* {expiry} {expiry_type(expiry, expiries)}\n"
-                            f"*Price:* ₹{price}\n\n"
-                            f"*OI Details:*\n"
-                            f"• OI: {oi:,}\n"
-                            f"• Change in OI: {chg_oi:+,}\n"
-                            f"• Lots: {lots}\n"
-                            f"• IV: {iv:.2f}%\n"
-                            f"• IV ROC: {ivroc:+.1f}%\n\n"
-                            f"*Option Trend:* {opt_trend}\n\n"
-                            f"*Futures OI:* {f_trend}\n"
-                            f"{f_msg}\n"
-                            f"Future Price: ₹{latest_future['price'] if latest_future else 'N/A'}\n"
+                            f"{trigger}\n\n"
+                            f"Expiry: {expiry} {label:<32} • Future Expiry: {fut_pc}\n"
+                            f"Strike: {strike} {typ}, Price: ₹{price}        • Futures OI: {f_trend}\n\n"
+                            f"OI Details: as below now Spot price: {spot:<8}  Future:\n"
+                            f"• OI: {oi:,} & Change in OI: {chg_oi:+,}        • Price: ₹{fut_price}\n"
+                            f"• Lots: {lots} & IV: {iv:.2f}% & IV ROC: {ivroc:+.1f}%  • OI: {fut_oi:,}\n"
+                            f"                                               • ΔOI: {fut_doi:+,}\n\n"
+                            f"Option Trend: {opt_trend:<35} {f_msg}\n\n"
+                            f"🟩 Market Bias: *{bias}*\n"
+                            f"Reason: {reason}\n\n"
                             f"Time: {now_ist().strftime('%H:%M:%S')} IST"
                         )
 
@@ -324,28 +375,29 @@ def run_kalpe_super_scanner():
 
                     hist[key] = {"oi": oi, "iv": iv, "price": price}
 
+    # --------------------------
+    # HEARTBEAT
+    # --------------------------
     def heartbeat():
         while True:
-            print("KALPE 2025 SUPER SCANNER alive:", now_ist())
+            print("ALIVE:", now_ist())
             time.sleep(60)
 
+    # --------------------------
+    # MAIN RUNNER
+    # --------------------------
     def main():
-        send(
-            "🚀 *KALPE BHAI SUPER SPIKE SCANNER STARTED*\n\n"
-            "Mode: *Aggressive Fast Retry* (1-min NSE block recovery)\n"
-            "Features: Super Spike + Future Trend + Full Details"
-        )
+        send("🚀 *KALPE SUPER SCANNER STARTED*")
         threading.Thread(target=fetch_loop, daemon=True).start()
         threading.Thread(target=super_scanner, daemon=True).start()
         threading.Thread(target=heartbeat, daemon=True).start()
 
         while True:
-            time.sleep(999999)
+            time.sleep(99999)
 
     main()
 
 
-# Alias for old runner name (so your runner still works)
 def run_kalpe_2025_scanner():
     run_kalpe_super_scanner()
 
