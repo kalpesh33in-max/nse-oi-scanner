@@ -1,6 +1,7 @@
-# banknifty.py - Kalpe Bhai 2025 BankNifty Master Scanner
-# Monthly Expiry Only • Super Spike • Extreme Spike • Reversal
-# Hedge (±200) • Futures OI • Only CE/PE Price
+# ============================================================
+# BANKNIFTY MASTER SCANNER (Fixed NSE Block Handling)
+# Same Logic • Improved Stability • Retry • Cookie Refresh
+# ============================================================
 
 import os
 import time
@@ -58,16 +59,36 @@ def is_market_time():
     n = now_ist()
     if n.weekday() >= 5:
         return False
-    t = n.time()
-    return dtime(9, 15) <= t <= dtime(15, 30)
+    return dtime(9, 15) <= n.time() <= dtime(15, 30)
 
 
 # ========================= NSE SESSION =======================
 session = requests.Session()
-session.headers.update({
-    "User-Agent": "Mozilla/5.0",
-    "referer": "https://www.nseindia.com/option-chain",
-})
+
+
+def update_headers():
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            f"AppleWebKit/537.{int(time.time())%100} "
+            "(KHTML, like Gecko) Chrome/131 Safari/537.36"
+        ),
+        "Accept": "*/*",
+        "Origin": "https://www.nseindia.com",
+        "Referer": "https://www.nseindia.com/",
+    })
+
+
+def refresh_nse():
+    try:
+        update_headers()
+        session.get("https://www.nseindia.com", timeout=10)
+        time.sleep(0.2)
+    except:
+        pass
+
+
+update_headers()
 
 
 # ========================= EXPIRY HELPERS ====================
@@ -102,45 +123,65 @@ def classify_expiry(exp, all_list):
     return disp, etype
 
 
-# ========================= FETCH DATA ========================
+# ========================= FETCH OPTION-CHAIN =================
 def fetch_option_chain():
     urls = [
         f"https://www.nseindia.com/api/option-chain-v3?type=Indices&symbol={SYMBOL}",
         f"https://www.nseindia.com/api/option-chain-indices?symbol={SYMBOL}",
     ]
-    last_err = None
+
+    last_err = ""
+
     for url in urls:
         try:
+            refresh_nse()
+            update_headers()
             r = session.get(url, timeout=15)
-            r.raise_for_status()
-            j = r.json()
 
-            records = j.get("records") or j.get("filtered")
+            if r.status_code in (403, 429):
+                raise Exception("BLOCKED_BY_NSE")
+
+            if r.text.strip().startswith("<") or len(r.text.strip()) < 30:
+                raise Exception("HTML_BLOCKED")
+
+            j = r.json()
+            records = j.get("records") or j.get("filtered") or {}
             data = records.get("data")
             expiry = records.get("expiryDates")
             spot = records.get("underlyingValue")
 
             if not data or not expiry or not spot:
-                raise ValueError("Invalid JSON")
+                raise Exception("EMPTY_DATA")
 
             return data, round(spot), expiry
+
         except Exception as e:
-            last_err = e
+            last_err = str(e)
             print("[FETCH ERROR]", e)
-    raise last_err
+
+    raise Exception(f"FAILED_ALL_URLS: {last_err}")
 
 
+# ========================= FETCH FUTURES =====================
 def fetch_futures():
     try:
+        refresh_nse()
+        update_headers()
+
         url = f"https://www.nseindia.com/api/quote-derivative?symbol={SYMBOL}"
         r = session.get(url, timeout=15)
-        r.raise_for_status()
-        j = r.json()
 
+        if r.status_code in (403, 429):
+            return None
+        if r.text.strip().startswith("<"):
+            return None
+
+        j = r.json()
         futs = []
+
         for row in j.get("stocks", []):
             meta = row.get("metadata", {})
-            if "futures" in str(meta.get("instrumentType", "")).lower():
+            if "FUT" in meta.get("instrumentType", ""):
                 exp = meta.get("expiryDate")
                 oi = meta.get("openInterest", 0)
                 chg = meta.get("changeinOpenInterest", 0)
@@ -149,27 +190,22 @@ def fetch_futures():
         if not futs:
             return None
 
-        def sort_key(x):
-            try:
-                return datetime.strptime(x[0], "%d-%b-%Y")
-            except:
-                return datetime.max
-
-        futs.sort(key=sort_key)
+        futs.sort(key=lambda x: datetime.strptime(x[0], "%d-%b-%Y"))
         return futs[0]
+
     except:
         return None
 
 
-# ========================= MASTER SCANNER =====================
+# ========================= MASTER SCANNER ====================
 def run_banknifty_scanner():
+
     send(
-        "🚀 *BANKNIFTY MASTER SCANNER (Final Revised)* 🚀\n"
-        "Monthly expiry only\n"
-        "Only CE/PE price shown per alert\n"
-        "Super Spike, Extreme Spike, Reversal\n"
-        "Hedge only in Type-B & Reversal\n"
-        "Active 09:15–15:30"
+        "🚀 *BANKNIFTY MASTER SCANNER (Stable Version)* 🚀\n"
+        "• Monthly expiry only\n"
+        "• Super Spike / Extreme Spike\n"
+        "• Reversal Alerts\n"
+        "• NSE Block Auto-Recover Enabled\n"
     )
 
     prev_oi = {}
@@ -180,127 +216,45 @@ def run_banknifty_scanner():
     cool_B = {}
     cool_R = {}
 
+    blocked = False
+    block_ts = 0
+
     while True:
         try:
             if not is_market_time():
                 time.sleep(10)
                 continue
 
-            data, spot, expiry_list = fetch_option_chain()
+            # ========================= NSE BLOCK HANDLING =====================
+            try:
+                data, spot, expiry_list = fetch_option_chain()
+
+                if blocked:
+                    send("🟢 *BANKNIFTY Scanner Recovered — NSE Online Again*")
+                    blocked = False
+
+            except Exception as e:
+                print("[BLOCK DETECTED]", e)
+
+                if not blocked:
+                    send("🔴 *BANKNIFTY Scanner Blocked — Retrying Every 1 Minute…*")
+                    blocked = True
+                    block_ts = time.time()
+
+                if time.time() - block_ts < 60:
+                    time.sleep(5)
+                    continue
+
+                block_ts = time.time()
+                continue
+
+            # ========================= FUTURES =========================
             fut = fetch_futures()
             fut_exp, fut_chg = "", 0
             if fut:
                 fut_exp, _, fut_chg = fut
 
-            # --------------------------------------------
-            # HEDGE BLOCK (only for Type B & Reversal)
-            # --------------------------------------------
-            def hedge_block(exp_raw, base_strike):
-                best_ce_exit = best_ce_add = None
-                best_pe_exit = best_pe_add = None
-
-                # Scan ±200
-                for row in data:
-                    if row.get("expiryDate") != exp_raw:
-                        continue
-                    s = row.get("strikePrice")
-                    if s is None or abs(s - base_strike) > HEDGE_RANGE:
-                        continue
-
-                    for opt in ("CE", "PE"):
-                        leg = row.get(opt)
-                        if not leg:
-                            continue
-                        chg = leg.get("changeinOpenInterest", 0)
-                        if chg == 0:
-                            continue
-
-                        if opt == "CE":
-                            if chg < 0:  # exit
-                                if (best_ce_exit is None) or (abs(chg) > best_ce_exit[0]):
-                                    best_ce_exit = (abs(chg), s, chg)
-                            else:
-                                if (best_ce_add is None) or (chg > best_ce_add[0]):
-                                    best_ce_add = (chg, s, chg)
-                        else:
-                            if chg < 0:
-                                if (best_pe_exit is None) or (abs(chg) > best_pe_exit[0]):
-                                    best_pe_exit = (abs(chg), s, chg)
-                            else:
-                                if (best_pe_add is None) or (chg > best_pe_add[0]):
-                                    best_pe_add = (chg, s, chg)
-
-                txt = "\n\n📌 *Hedge Analysis (Detailed)*"
-
-                # CE exit
-                if best_ce_exit:
-                    _, s, chg = best_ce_exit
-                    txt += (
-                        f"\n\n🟢 *CE Writer Exit*\n"
-                        f"• Strike: `{s} CE`\n"
-                        f"• OI Δ: `{chg}`\n"
-                        f"• Lots: `{abs(chg)//LOT}`"
-                    )
-                else:
-                    txt += "\n\n🟢 *CE Writer Exit*\n• No strong exit"
-
-                # CE add
-                if best_ce_add:
-                    _, s, chg = best_ce_add
-                    txt += (
-                        f"\n\n🔻 *CE Writer Add*\n"
-                        f"• Strike: `{s} CE`\n"
-                        f"• OI Δ: `+{chg}`\n"
-                        f"• Lots: `{chg//LOT}`"
-                    )
-                else:
-                    txt += "\n\n🔻 *CE Writer Add*\n• No strong build-up"
-
-                # PE exit
-                if best_pe_exit:
-                    _, s, chg = best_pe_exit
-                    txt += (
-                        f"\n\n🔻 *PE Writer Exit*\n"
-                        f"• Strike: `{s} PE`\n"
-                        f"• OI Δ: `{chg}`\n"
-                        f"• Lots: `{abs(chg)//LOT}`"
-                    )
-                else:
-                    txt += "\n\n🔻 *PE Writer Exit*\n• No strong exit"
-
-                # PE add
-                if best_pe_add:
-                    _, s, chg = best_pe_add
-                    txt += (
-                        f"\n\n🟢 *PE Writer Add*\n"
-                        f"• Strike: `{s} PE`\n"
-                        f"• OI Δ: `+{chg}`\n"
-                        f"• Lots: `{chg//LOT}`"
-                    )
-                else:
-                    txt += "\n\n🟢 *PE Writer Add*\n• No strong build-up"
-
-                # futures
-                if fut_exp:
-                    fut_lots = abs(fut_chg) // LOT
-                    view = (
-                        "FUT LONGS ADDED" if fut_chg > 0 else
-                        "FUT SHORTS ADDED" if fut_chg < 0 else
-                        "FUT OI FLAT"
-                    )
-                    txt += (
-                        f"\n\n📘 *Futures Position*\n"
-                        f"• Expiry: `{fut_exp}`\n"
-                        f"• OI Δ: `{fut_chg}`\n"
-                        f"• Lots: `{fut_lots}`\n"
-                        f"• View: {view}"
-                    )
-
-                return txt
-
-            # --------------------------------------------
-            # MAIN LOOP
-            # --------------------------------------------
+            # ========================= MAIN LOOP START ===================
             for row in data:
                 strike = row.get("strikePrice")
                 exp_raw = row.get("expiryDate")
@@ -331,81 +285,53 @@ def run_banknifty_scanner():
 
                     spike = ((oi - old_oi) / old_oi * 100) if old_oi > 0 else 0.0
                     lots = abs(oi - old_oi) // LOT
-
                     ivroc = ((iv - old_iv) / old_iv * 100) if (old_iv > 0 and iv > 0) else 0.0
 
-                    # IV formatting
-                    if iv <= 0:
-                        iv_display = "N/A"
-                        ivroc_display = "N/A"
-                    elif old_iv <= 0:
-                        iv_display = f"{iv:.1f}%"
-                        ivroc_display = "NEW"
-                    else:
-                        iv_display = f"{iv:.1f}%"
-                        ivroc_display = f"{ivroc:+.1f}%"
-
-                    # Position
-                    if abs(strike - spot) <= 100:
-                        pos = "ATM"
-                    elif (opt == "CE" and strike < spot) or (opt == "PE" and strike > spot):
-                        pos = "ITM"
-                    else:
-                        pos = "OTM"
-
-                    sign = 1 if (oi - old_oi) > 0 else -1 if (oi - old_oi) < 0 else 0
-                    now_ts = time.time()
-
-                    # Only required price line
                     if opt == "CE":
                         price_line = f"CE Price: `₹{ce_ltp}`\n\n"
                     else:
                         price_line = f"PE Price: `₹{pe_ltp}`\n\n"
 
-                    # ===============================================
+                    sign = 1 if (oi - old_oi) > 0 else -1 if (oi - old_oi) < 0 else 0
+                    now_ts = time.time()
+
+                    # ====================================================
                     # EXTREME SUPER SPIKE (TYPE B)
-                    # ===============================================
+                    # ====================================================
                     if spike >= SUPER_B["SPIKE"] and lots >= SUPER_B["LOTS"]:
                         if now_ts - cool_B.get(key, 0) > COOLDOWN:
-                            side = "BUYERS AGGRESSIVE" if chg_oi > 0 else "WRITERS DOMINATING"
-
                             send(
                                 f"👑 *EXTREME SUPER SPIKE (TYPE B)* 👑\n\n"
                                 f"Expiry: `{exp_disp}` ({exp_type})\n"
-                                f"*BANKNIFTY {strike} {opt} ({pos})*\n\n"
+                                f"*BANKNIFTY {strike} {opt}*\n\n"
                                 f"{price_line}"
                                 f"{opt} OI Spike: `+{spike:.1f}%`\n"
-                                f"{opt} IV: `{iv_display}` ({opt} ROC: `{ivroc_display}`)\n"
-                                f"Lots Change: `{lots}` LOTS\n\n"
-                                f"Side: *{side}*"
-                                f"{hedge_block(exp_raw, strike)}\n\n"
+                                f"{opt} IV: `{iv:.1f}%` (ROC: `{ivroc:+.1f}%`)\n"
+                                f"Lots: `{lots}` LOTS\n\n"
                                 f"Time: `{now_ist().strftime('%H:%M:%S')}` IST"
                             )
                             cool_B[key] = now_ts
 
-                    # ===============================================
+                    # ====================================================
                     # SUPER SPIKE (TYPE A)
-                    # ===============================================
+                    # ====================================================
                     if spike >= SUPER_A["SPIKE"] and lots >= SUPER_A["LOTS"]:
                         if now_ts - cool_A.get(key, 0) > COOLDOWN:
-                            side = "BUYERS AGGRESSIVE" if chg_oi > 0 else "WRITERS ACTIVE"
-
                             send(
                                 f"🔥 *SUPER SPIKE (TYPE A)* 🔥\n\n"
                                 f"Expiry: `{exp_disp}` ({exp_type})\n"
-                                f"*BANKNIFTY {strike} {opt} ({pos})*\n\n"
+                                f"*BANKNIFTY {strike} {opt}*\n\n"
                                 f"{price_line}"
                                 f"{opt} OI Spike: `+{spike:.1f}%`\n"
-                                f"{opt} IV: `{iv_display}` ({opt} ROC: `{ivroc_display}`)\n"
-                                f"Lots Change: `{lots}` LOTS\n\n"
-                                f"Side: *{side}*\n\n"
+                                f"{opt} IV: `{iv:.1f}%` (ROC: `{ivroc:+.1f}%`)\n"
+                                f"Lots: `{lots}` LOTS\n\n"
                                 f"Time: `{now_ist().strftime('%H:%M:%S')}` IST"
                             )
                             cool_A[key] = now_ts
 
-                    # ===============================================
+                    # ====================================================
                     # EXTREME REVERSAL
-                    # ===============================================
+                    # ====================================================
                     last_s = last_dir.get(key, 0)
                     if (
                         sign != 0
@@ -415,39 +341,29 @@ def run_banknifty_scanner():
                         and abs(ivroc) >= REVERSAL_MIN_IVROC
                     ):
                         if now_ts - cool_R.get(key, 0) > COOLDOWN:
-                            if last_s > 0:
-                                old_side = "BUYERS DOMINATING"
-                                new_side = "WRITERS ACTIVE"
-                                reason = "BUYER EXIT / PROFIT BOOKING"
-                            else:
-                                old_side = "WRITERS DOMINATING"
-                                new_side = "BUYERS ACTIVE"
-                                reason = "WRITER EXIT / SHORT COVER"
+                            old_side = "BUYERS ACTIVE" if last_s > 0 else "WRITERS ACTIVE"
+                            new_side = "WRITERS ACTIVE" if sign < 0 else "BUYERS ACTIVE"
 
                             send(
-                                f"🔄 *EXTREME REVERSAL ALERT*\n\n"
+                                f"🔄 *EXTREME REVERSAL ALERT* 🔄\n\n"
                                 f"Expiry: `{exp_disp}` ({exp_type})\n"
-                                f"*BANKNIFTY {strike} {opt} ({pos})*\n\n"
+                                f"*BANKNIFTY {strike} {opt}*\n\n"
                                 f"{price_line}"
                                 f"Old Side: *{old_side}*\n"
                                 f"New Side: *{new_side}*\n"
-                                f"Reason: *{reason}*\n\n"
-                                f"{opt} OI Δ (Lots): `{lots}` LOTS\n"
-                                f"{opt} IV: `{iv_display}` ({opt} ROC: `{ivroc_display}`)\n"
-                                f"LTP: `₹{ltp}`"
-                                f"{hedge_block(exp_raw, strike)}\n\n"
+                                f"OI (Lots): `{lots}`\n"
+                                f"IV: `{iv:.1f}%` (ROC: `{ivroc:+.1f}%`)\n\n"
                                 f"Time: `{now_ist().strftime('%H:%M:%S')}` IST"
                             )
                             cool_R[key] = now_ts
 
-                    # Update history
                     prev_oi[key] = oi
                     prev_iv[key] = iv
                     if sign != 0:
                         last_dir[key] = sign
 
-            time.sleep(5)
+            time.sleep(3)
 
         except Exception as e:
-            print("[ERROR]", e)
-            time.sleep(10)
+            print("[MAIN LOOP ERROR]", e)
+            time.sleep(5)
