@@ -1,5 +1,5 @@
 # kalpe_dashboard_app.py
-# Kalpe Bhai Web Dashboard + 5 Scanner Runner
+# Kalpe Bhai Web Dashboard + 5 Scanner Runner (Simple Table Style)
 
 import os
 import time
@@ -8,9 +8,10 @@ import traceback
 from datetime import datetime, time as dtime
 
 import requests
+import pytz
 from flask import Flask, jsonify, render_template_string
 
-# === IMPORT ALL 5 SCANNERS (already updated & NSE-safe) ===
+# ==== IMPORT ALL 5 SCANNERS (already NSE-safe) ====
 from start_kalpe_nifty_master import start_kalpe_nifty_master
 from nifty import run_nifty_scanner
 from banknifty import run_banknifty_scanner
@@ -18,11 +19,12 @@ from iv_roc_scanner import run_iv_roc_scanner
 from nifty_kalpe_bhai_2025 import run_kalpe_2025_scanner
 
 
-# ==========================================================
-#  THREAD STARTER: AUTO-RESTART ANY CRASHED SCANNER
-# ==========================================================
+# ======================================================
+#   THREAD STARTER: AUTO-RESTART ANY CRASHED SCANNER
+# ======================================================
 
 def start_scanner(name, target):
+    """Runs each scanner in a self-restarting thread."""
     def runner():
         while True:
             try:
@@ -40,11 +42,11 @@ def start_scanner(name, target):
     return t
 
 
-# ==========================================================
-#  DASHBOARD DATA FETCHER (LIGHTWEIGHT, 1 REQUEST / MIN)
-# ==========================================================
+# ======================================================
+#   DASHBOARD DATA FETCHER (LIGHT, 1 REQ / MIN / SYMBOL)
+# ======================================================
 
-IST = "Asia/Kolkata"
+IST = pytz.timezone("Asia/Kolkata")
 
 session = requests.Session()
 session.headers.update({
@@ -62,10 +64,12 @@ session.headers.update({
 
 _last_cookie_refresh = 0.0
 
+
 def ensure_nse_session(force=False):
+    """Refresh NSE cookies approx every 30 min."""
     global _last_cookie_refresh
     now = time.time()
-    if not force and now - _last_cookie_refresh < 1800:
+    if not force and (now - _last_cookie_refresh) < 1800:
         return
     try:
         session.get("https://www.nseindia.com", timeout=10)
@@ -74,27 +78,31 @@ def ensure_nse_session(force=False):
     except Exception as e:
         print("[DASHBOARD] Cookie refresh error:", e)
 
+
 def ensure_json(r):
+    """Detect HTML / captcha instead of JSON."""
     ct = r.headers.get("content-type", "").lower()
     txt = r.text.strip().lower()
     if "html" in ct or txt.startswith("<!doctype html") or txt.startswith("<html"):
         raise RuntimeError("HTML_BLOCKED")
     return r
 
-# shared dashboard state
+
+# Shared dashboard state
 dashboard_lock = threading.Lock()
 dashboard_data = {
     "updated": None,
-    "rows": []  # list of dicts with symbol/strike/type/metrics
+    "rows": []  # list of dicts
 }
 
-# per-symbol previous snapshot (for % change)
+# Previous snapshot for % change (per symbol+strike+type)
 prev_snapshot = {
     "NIFTY": {},
     "BANKNIFTY": {},
 }
 
-def fetch_oc(symbol):
+
+def fetch_oc(symbol: str):
     urls = [
         f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}",
         f"https://www.nseindia.com/api/option-chain-v3?type=Indices&symbol={symbol}",
@@ -108,37 +116,40 @@ def fetch_oc(symbol):
             ensure_json(r)
             j = r.json()
             rec = j.get("records") or j.get("filtered")
-            if not rec:
-                continue
-            return rec
+            if rec:
+                return rec
         except Exception as e:
             last_err = e
             print(f"[DASHBOARD] {symbol} fetch error:", e)
-    raise last_err or RuntimeError("No data")
+    raise last_err or RuntimeError(f"{symbol} no data")
+
 
 def dash_updater_loop():
-    """Background thread: refresh dashboard rows every 60 sec."""
+    """Background: refresh dashboard rows every 60 sec."""
     ensure_nse_session(force=True)
     while True:
         try:
-            now = datetime.now().astimezone()
-            # market time filter (9:15–15:30 IST approx)
+            now = datetime.now(IST)
             t = now.time()
+
+            # Only during market hours
             if not (dtime(9, 15) <= t <= dtime(15, 30)):
                 time.sleep(30)
                 continue
 
             rows = []
+
             for symbol in ("NIFTY", "BANKNIFTY"):
                 try:
                     rec = fetch_oc(symbol)
                 except Exception as e:
-                    print(f"[DASHBOARD] {symbol} skipped, error:", e)
+                    print(f"[DASHBOARD] {symbol} skipped:", e)
                     continue
 
                 spot = rec.get("underlyingValue") or 0
                 if not spot:
                     continue
+
                 if symbol == "NIFTY":
                     step = 50
                     rng = 200
@@ -161,7 +172,7 @@ def dash_updater_loop():
 
                     for opt_type in ("CE", "PE"):
                         leg = item.get(opt_type) or {}
-                        oi = leg.get("openInterest", 0)
+                        oi = int(leg.get("openInterest", 0) or 0)
                         iv = float(leg.get("impliedVolatility", 0) or 0.0)
                         ltp = float(leg.get("lastPrice", 0) or 0.0)
 
@@ -171,8 +182,8 @@ def dash_updater_loop():
                         oi_roc = ((oi - old["oi"]) / old["oi"] * 100) if old["oi"] > 0 else 0.0
                         iv_roc = ((iv - old["iv"]) / old["iv"] * 100) if old["iv"] > 0 else 0.0
 
-                        # OVROC = combined score (simple sum)
-                        ovroc = oi_roc + iv_roc
+                        ovroc = oi_roc + iv_roc   # simple combined score
+                        ovroc_pct = ovroc         # for display both OVROC & OVROC%
 
                         prev[key] = {"oi": oi, "iv": iv}
 
@@ -182,26 +193,32 @@ def dash_updater_loop():
                             "type": opt_type,
                             "tag": tag,
                             "spot": round(spot),
-                            "oi": int(oi),
+                            "ltp": round(ltp, 2),
+                            "oi": oi,
                             "oi_roc": round(oi_roc, 1),
                             "iv": round(iv, 2),
                             "iv_roc": round(iv_roc, 1),
                             "ovroc": round(ovroc, 1),
+                            "ovroc_pct": round(ovroc_pct, 1),
                         })
 
+            # Sort rows: strongest OVROC on top
+            rows.sort(key=lambda r: abs(r["ovroc"]), reverse=True)
+
             with dashboard_lock:
-                dashboard_data["updated"] = datetime.now().strftime("%H:%M:%S")
+                dashboard_data["updated"] = datetime.now(IST).strftime("%H:%M:%S")
                 dashboard_data["rows"] = rows
 
         except Exception as e:
-            print("[DASHBOARD] updater fatal error:", e)
+            print("[DASHBOARD] updater fatal:", e)
             traceback.print_exc()
 
-        time.sleep(60)  # refresh interval
+        time.sleep(60)
 
-# ==========================================================
-#  FLASK WEB APP
-# ==========================================================
+
+# ======================================================
+#   FLASK WEB APP (STYLE A – SIMPLE TABLE)
+# ======================================================
 
 app = Flask(__name__)
 
@@ -210,28 +227,27 @@ HTML_PAGE = """
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Kalpe Bhai OI & IV Dashboard</title>
+  <title>Kalpe Bhai – OI & IV Dashboard</title>
   <style>
-    body { font-family: Arial, sans-serif; background:#050816; color:#eee; margin:0; padding:0; }
+    body { font-family: Arial, sans-serif; background:#050816; color:#e5e7eb; margin:0; }
     h1 { text-align:center; padding:10px 0; margin:0; }
-    .info { text-align:center; margin-bottom:10px; font-size:13px; color:#aaa; }
-    table { width: 98%; margin: 0 auto 20px auto; border-collapse: collapse; font-size: 13px; }
-    th, td { padding: 4px 6px; text-align: right; }
-    th { background:#111827; position: sticky; top:0; z-index:10; }
-    tr:nth-child(even) { background:#0b1220; }
-    tr:nth-child(odd) { background:#020617; }
+    .info { text-align:center; font-size:13px; color:#9ca3af; margin-bottom:8px; }
+    table { width:98%; margin:0 auto 16px auto; border-collapse:collapse; font-size:12px; }
+    th, td { padding:4px 5px; border-bottom:1px solid #111827; text-align:right; }
+    th { background:#0f172a; position:sticky; top:0; z-index:10; }
     td.symbol, th.symbol { text-align:left; }
     td.center { text-align:center; }
-    .pos { font-weight:bold; }
-    .bull { color:#4ade80; }
-    .bear { color:#f97373; }
+    tr:nth-child(even) { background:#020617; }
+    tr:nth-child(odd) { background:#020617; }
+    .bull { color:#22c55e; font-weight:bold; }
+    .bear { color:#f97373; font-weight:bold; }
     .neutral { color:#e5e7eb; }
   </style>
 </head>
 <body>
   <h1>Kalpe Bhai – OI / IV / ROC Dashboard</h1>
   <div class="info">
-    Live from Railway | Refresh every 10 sec | Updated: <span id="updated">--:--:--</span>
+    Simple Table View • Auto refresh 10 sec • Updated: <span id="updated">--:--:--</span>
   </div>
   <table id="tbl">
     <thead>
@@ -241,6 +257,7 @@ HTML_PAGE = """
         <th>Type</th>
         <th>Tag</th>
         <th>Spot</th>
+        <th>LTP</th>
         <th>OI</th>
         <th>OI%</th>
         <th>IV</th>
@@ -276,12 +293,13 @@ async function loadData() {
         <td class="center">${row.type}</td>
         <td class="center">${row.tag}</td>
         <td>${row.spot}</td>
+        <td>${row.ltp.toFixed(2)}</td>
         <td>${row.oi.toLocaleString()}</td>
         <td>${row.oi_roc.toFixed(1)}%</td>
         <td>${row.iv.toFixed(2)}</td>
         <td>${row.iv_roc.toFixed(1)}%</td>
-        <td class="pos ${biasClass}">${row.ovroc.toFixed(1)}</td>
-        <td class="${biasClass}">${row.ovroc.toFixed(1)}%</td>
+        <td class="${biasClass}">${row.ovroc.toFixed(1)}</td>
+        <td class="${biasClass}">${row.ovroc_pct.toFixed(1)}%</td>
       `;
       tbody.appendChild(tr);
     });
@@ -306,24 +324,25 @@ def api_dashboard():
     with dashboard_lock:
         return jsonify(dashboard_data)
 
-# ==========================================================
-#  MAIN ENTRY: START 5 SCANNERS + DASHBOARD SERVER
-# ==========================================================
+
+# ======================================================
+#   ENTRY POINT: START 5 SCANNERS + DASHBOARD SERVER
+# ======================================================
 
 def main():
     print("🔥 Starting 5 scanners + Web Dashboard for Kalpe Bhai")
 
-    # start scanners in background
+    # scanners in background threads
     start_scanner("MASTER", start_kalpe_nifty_master)
     start_scanner("NIFTY_75", run_nifty_scanner)
     start_scanner("BANKNIFTY", run_banknifty_scanner)
     start_scanner("IV_ROC", run_iv_roc_scanner)
     start_scanner("KALPE_2025", run_kalpe_2025_scanner)
 
-    # start dashboard updater thread
+    # dashboard data updater thread
     threading.Thread(target=dash_updater_loop, daemon=True).start()
 
-    # run flask app (main thread)
+    # Flask app in main thread (Railway will expose this)
     port = int(os.getenv("PORT", "8000"))
     app.run(host="0.0.0.0", port=port)
 
