@@ -8,6 +8,10 @@ import time
 from datetime import datetime
 from flask import Flask, render_template_string
 
+app = Flask(__name__)
+
+RUN_SCANNERS = os.environ.get("RUN_SCANNERS", "0") == "1"
+
 # -------------------- IMPORT SCANNERS --------------------
 from start_kalpe_nifty_master import start_kalpe_nifty_master
 from nifty import run_nifty_scanner
