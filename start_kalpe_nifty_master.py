@@ -31,24 +31,68 @@ REVERSAL_COOLDOWN = 60
 # ================== NSE SESSION ==================
 session = requests.Session()
 
-session.headers.update({
+# Use DESKTOP browser headers (mobile headers block hone ka chance zyada)
+BASE_HEADERS = {
     "authority": "www.nseindia.com",
-    "accept": "*/*",
+    "accept": "application/json, text/plain, */*",
     "accept-encoding": "gzip, deflate, br, zstd",
     "accept-language": "en-US,en;q=0.9,en-IN;q=0.8",
     "referer": "https://www.nseindia.com/option-chain",
-    "sec-ch-ua": '"Chromium";v="142", "Microsoft Edge";v="142", "Not_A Brand";v="99"',
-    "sec-ch-ua-mobile": "?1",
-    "sec-ch-ua-platform": '"Android"',
-    "sec-fetch-dest": "empty",
-    "sec-fetch-mode": "cors",
-    "sec-fetch-site": "same-origin",
     "user-agent": (
-        "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) "
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/142.0.0.0 Mobile Safari/537.36 Edg/142.0.0.0"
+        "Chrome/120.0.0.0 Safari/537.36"
     ),
-})
+    "connection": "keep-alive",
+}
+
+session.headers.update(BASE_HEADERS)
+
+_last_cookie_refresh = 0.0
+
+
+def ensure_nse_session(force: bool = False):
+    """
+    NSE ko stable banane ke liye:
+    - Home page hit karo taaki cookies mil jaye
+    - Har ~30 min refresh
+    - Agar force=True, turant refresh
+    """
+    global _last_cookie_refresh
+    now = time.time()
+    if not force and (now - _last_cookie_refresh) < 1800:
+        return
+
+    try:
+        r = session.get("https://www.nseindia.com", timeout=10)
+        # Agar HTML mila, that's fine; purpose = cookies set karna
+        if r.status_code == 200:
+            _last_cookie_refresh = now
+            print("[NSE] Session refreshed OK")
+        else:
+            print("[NSE] Session refresh status:", r.status_code)
+    except Exception as e:
+        print("[NSE] Session refresh error:", e)
+
+
+def _ensure_json_response(r: requests.Response, label: str):
+    """
+    Some NSE blocks: HTML / Captcha page.
+    JSON parse se pehle check kar lein.
+    """
+    ct = r.headers.get("content-type", "").lower()
+    text_preview = r.text[:50].strip().lower()
+
+    # Typical HTML / blocked content check
+    if (
+        "text/html" in ct
+        or text_preview.startswith("<!doctype html")
+        or text_preview.startswith("<html")
+    ):
+        raise RuntimeError(f"{label}: HTML_BLOCKED")
+
+    return r
+
 
 # ================== TIME HELPERS ==================
 IST_TZ = pytz.timezone("Asia/Kolkata")
@@ -148,10 +192,13 @@ def fetch_option_chain():
     ]
 
     last_error = None
+    ensure_nse_session()  # make sure cookies are fresh
+
     for url in urls:
         try:
             r = session.get(url, timeout=15)
             r.raise_for_status()
+            _ensure_json_response(r, "OPTION_CHAIN")
             j = r.json()
 
             records = j.get("records") or j.get("filtered")
@@ -176,9 +223,11 @@ def fetch_option_chain():
 
 # ================== FETCH FUTURES ==================
 def fetch_futures():
+    ensure_nse_session()
     url = f"https://www.nseindia.com/api/quote-derivative?symbol={NIFTY_SYMBOL}"
     r = session.get(url, timeout=15)
     r.raise_for_status()
+    _ensure_json_response(r, "FUTURES")
     j = r.json()
 
     stocks = j.get("stocks") or []
@@ -212,6 +261,9 @@ def fetch_futures():
 def data_fetch_loop():
     global latest_nifty, latest_fut, blocked, last_block_time
 
+    # First time: force cookie refresh
+    ensure_nse_session(force=True)
+
     while True:
         try:
             if not is_trading_day():
@@ -221,6 +273,7 @@ def data_fetch_loop():
                 time.sleep(30)
                 continue
 
+            # If previously blocked, cool-down for 5 minutes
             if blocked:
                 if time.time() - last_block_time < 300:
                     time.sleep(10)
@@ -236,7 +289,7 @@ def data_fetch_loop():
             except Exception as e:
                 err = str(e).lower()
                 print("[FETCH LOOP ERROR]", e)
-                if any(x in err for x in ["403", "forbidden", "blocked", "429", "captcha"]):
+                if any(x in err for x in ["403", "forbidden", "blocked", "429", "captcha", "html_blocked"]):
                     if not blocked:
                         blocked = True
                         last_block_time = time.time()
@@ -255,6 +308,8 @@ def data_fetch_loop():
                 blocked = False
                 last_block_time = 0.0
 
+            # IMPORTANT: This scanner runs with 4 more scanners.
+            # 30 sec yahan, baaki scanners me bhi similar ya thoda zyda interval rakho.
             time.sleep(30)
 
         except Exception as e:
