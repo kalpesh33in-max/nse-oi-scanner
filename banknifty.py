@@ -1,5 +1,5 @@
 # ============================================================
-# BANKNIFTY MASTER SCANNER (Fixed NSE Block Handling)
+# BANKNIFTY MASTER SCANNER (Stable NSE Handling)
 # Same Logic • Improved Stability • Retry • Cookie Refresh
 # ============================================================
 
@@ -21,7 +21,7 @@ CHAT_IDS = [c.strip() for c in CHAT_RAW.split(",") if c.strip()]
 
 def send(msg: str):
     if not TOKEN or not CHAT_IDS:
-        print("TG OFF:", msg[:150])
+        print("TG OFF:", msg[:150].replace("\n", " "))
         return
     for cid in CHAT_IDS:
         try:
@@ -30,8 +30,8 @@ def send(msg: str):
                 json={"chat_id": cid, "text": msg, "parse_mode": "Markdown"},
                 timeout=10,
             )
-        except:
-            pass
+        except Exception as e:
+            print("TG ERROR:", e)
 
 
 # ========================= CONSTANTS =========================
@@ -39,7 +39,7 @@ SYMBOL = "BANKNIFTY"
 LOT = 35
 
 ATM_RANGE = 3000
-HEDGE_RANGE = 200
+HEDGE_RANGE = 200  # (not used in current logic, kept for future)
 
 SUPER_A = {"SPIKE": 20, "LOTS": 100}
 SUPER_B = {"SPIKE": 35, "LOTS": 200}
@@ -65,37 +65,69 @@ def is_market_time():
 # ========================= NSE SESSION =======================
 session = requests.Session()
 
+BASE_HEADERS = {
+    "authority": "www.nseindia.com",
+    "accept": "application/json, text/plain, */*",
+    "accept-encoding": "gzip, deflate, br, zstd",
+    "accept-language": "en-US,en;q=0.9,en-IN;q=0.8",
+    "referer": "https://www.nseindia.com/option-chain",
+    "user-agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "connection": "keep-alive",
+}
+session.headers.update(BASE_HEADERS)
+_last_cookie_refresh = 0.0
 
-def update_headers():
-    session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            f"AppleWebKit/537.{int(time.time())%100} "
-            "(KHTML, like Gecko) Chrome/131 Safari/537.36"
-        ),
-        "Accept": "*/*",
-        "Origin": "https://www.nseindia.com",
-        "Referer": "https://www.nseindia.com/",
-    })
 
+def ensure_nse_session(force: bool = False):
+    """
+    NSE ko stable banane ke liye:
+    - Home page hit karo taaki cookies mil jaye
+    - Har ~30 min refresh
+    - Agar force=True, turant refresh
+    """
+    global _last_cookie_refresh
+    now = time.time()
+    if not force and (now - _last_cookie_refresh) < 1800:
+        return
 
-def refresh_nse():
     try:
-        update_headers()
-        session.get("https://www.nseindia.com", timeout=10)
-        time.sleep(0.2)
-    except:
-        pass
+        r = session.get("https://www.nseindia.com", timeout=10)
+        if r.status_code == 200:
+            _last_cookie_refresh = now
+            print("[NSE] Session refreshed OK")
+        else:
+            print("[NSE] Session refresh status:", r.status_code)
+    except Exception as e:
+        print("[NSE] Session refresh error:", e)
 
 
-update_headers()
+def _ensure_json_response(r: requests.Response, label: str):
+    """
+    Some NSE blocks: HTML / Captcha page.
+    JSON parse se pehle check kar lein.
+    """
+    ct = r.headers.get("content-type", "").lower()
+    text_preview = r.text.strip().lower()[:80]
+
+    if (
+        "text/html" in ct
+        or text_preview.startswith("<!doctype html")
+        or text_preview.startswith("<html")
+    ):
+        raise RuntimeError(f"{label}: HTML_BLOCKED")
+
+    return r
 
 
 # ========================= EXPIRY HELPERS ====================
 def parse_expiry(s):
     try:
         return datetime.strptime(s, "%d-%b-%Y").date()
-    except:
+    except Exception:
         return None
 
 
@@ -110,7 +142,7 @@ def classify_expiry(exp, all_list):
 
     try:
         idx = parsed.index(d)
-    except:
+    except Exception:
         idx = 0
 
     if idx == 0:
@@ -134,15 +166,10 @@ def fetch_option_chain():
 
     for url in urls:
         try:
-            refresh_nse()
-            update_headers()
+            ensure_nse_session()
             r = session.get(url, timeout=15)
-
-            if r.status_code in (403, 429):
-                raise Exception("BLOCKED_BY_NSE")
-
-            if r.text.strip().startswith("<") or len(r.text.strip()) < 30:
-                raise Exception("HTML_BLOCKED")
+            r.raise_for_status()
+            _ensure_json_response(r, "OPTION_CHAIN")
 
             j = r.json()
             records = j.get("records") or j.get("filtered") or {}
@@ -151,37 +178,33 @@ def fetch_option_chain():
             spot = records.get("underlyingValue")
 
             if not data or not expiry or not spot:
-                raise Exception("EMPTY_DATA")
+                raise RuntimeError("EMPTY_DATA")
 
+            print("[OC] OK", url, "spot:", spot)
             return data, round(spot), expiry
 
         except Exception as e:
             last_err = str(e)
-            print("[FETCH ERROR]", e)
+            print("[FETCH ERROR]", url, ":", e)
 
-    raise Exception(f"FAILED_ALL_URLS: {last_err}")
+    raise RuntimeError(f"FAILED_ALL_URLS: {last_err}")
 
 
 # ========================= FETCH FUTURES =====================
 def fetch_futures():
     try:
-        refresh_nse()
-        update_headers()
-
+        ensure_nse_session()
         url = f"https://www.nseindia.com/api/quote-derivative?symbol={SYMBOL}"
         r = session.get(url, timeout=15)
-
-        if r.status_code in (403, 429):
-            return None
-        if r.text.strip().startswith("<"):
-            return None
+        r.raise_for_status()
+        _ensure_json_response(r, "FUTURES")
 
         j = r.json()
         futs = []
 
         for row in j.get("stocks", []):
             meta = row.get("metadata", {})
-            if "FUT" in meta.get("instrumentType", ""):
+            if "FUT" in str(meta.get("instrumentType", "")):
                 exp = meta.get("expiryDate")
                 oi = meta.get("openInterest", 0)
                 chg = meta.get("changeinOpenInterest", 0)
@@ -193,7 +216,8 @@ def fetch_futures():
         futs.sort(key=lambda x: datetime.strptime(x[0], "%d-%b-%Y"))
         return futs[0]
 
-    except:
+    except Exception as e:
+        print("[FUT ERROR]", e)
         return None
 
 
@@ -202,8 +226,8 @@ def run_banknifty_scanner():
 
     send(
         "🚀 *BANKNIFTY MASTER SCANNER (Stable Version)* 🚀\n"
-        "• Monthly expiry only\n"
-        "• Super Spike / Extreme Spike\n"
+        "• Monthly-style expiry classification\n"
+        "• Super Spike / Extreme Super Spike\n"
         "• Reversal Alerts\n"
         "• NSE Block Auto-Recover Enabled\n"
     )
@@ -218,6 +242,9 @@ def run_banknifty_scanner():
 
     blocked = False
     block_ts = 0
+
+    # Force first cookie refresh
+    ensure_nse_session(force=True)
 
     while True:
         try:
@@ -241,6 +268,7 @@ def run_banknifty_scanner():
                     blocked = True
                     block_ts = time.time()
 
+                # wait a bit before next retry
                 if time.time() - block_ts < 60:
                     time.sleep(5)
                     continue
@@ -362,6 +390,7 @@ def run_banknifty_scanner():
                     if sign != 0:
                         last_dir[key] = sign
 
+            # Frequency – same as before, but you can increase to 5–10s if NSE still blocks
             time.sleep(3)
 
         except Exception as e:
