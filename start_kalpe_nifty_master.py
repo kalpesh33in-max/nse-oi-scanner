@@ -31,7 +31,7 @@ REVERSAL_COOLDOWN = 60
 # ================== NSE SESSION ==================
 session = requests.Session()
 
-# Use DESKTOP browser headers (mobile headers block hone ka chance zyada)
+# Strong desktop browser headers for NSE
 BASE_HEADERS = {
     "authority": "www.nseindia.com",
     "accept": "application/json, text/plain, */*",
@@ -44,8 +44,16 @@ BASE_HEADERS = {
         "Chrome/120.0.0.0 Safari/537.36"
     ),
     "connection": "keep-alive",
-}
 
+    # extra headers – important to reduce 403 / captcha
+    "sec-fetch-site": "same-origin",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-dest": "empty",
+    "sec-ch-ua": '"Not/A)Brand";v="99", "Chromium";v="120", "Google Chrome";v="120"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "x-requested-with": "XMLHttpRequest",
+}
 session.headers.update(BASE_HEADERS)
 
 _last_cookie_refresh = 0.0
@@ -65,7 +73,6 @@ def ensure_nse_session(force: bool = False):
 
     try:
         r = session.get("https://www.nseindia.com", timeout=10)
-        # Agar HTML mila, that's fine; purpose = cookies set karna
         if r.status_code == 200:
             _last_cookie_refresh = now
             print("[NSE] Session refreshed OK")
@@ -80,10 +87,12 @@ def _ensure_json_response(r: requests.Response, label: str):
     Some NSE blocks: HTML / Captcha page.
     JSON parse se pehle check kar lein.
     """
-    ct = r.headers.get("content-type", "").lower()
-    text_preview = r.text[:50].strip().lower()
+    if r.status_code in (401, 403, 429, 500):
+        raise RuntimeError(f"{label}: HTTP_{r.status_code}")
 
-    # Typical HTML / blocked content check
+    ct = r.headers.get("content-type", "").lower()
+    text_preview = r.text.strip().lower()[:120]
+
     if (
         "text/html" in ct
         or text_preview.startswith("<!doctype html")
@@ -192,76 +201,96 @@ def fetch_option_chain():
     ]
 
     last_error = None
-    ensure_nse_session()  # make sure cookies are fresh
 
-    for url in urls:
-        try:
-            r = session.get(url, timeout=15)
-            r.raise_for_status()
-            _ensure_json_response(r, "OPTION_CHAIN")
-            j = r.json()
+    # 2 rounds: second round forces cookie refresh
+    for attempt in range(2):
+        if attempt == 1:
+            print("[OC] Forcing cookie refresh…")
+            ensure_nse_session(force=True)
+            time.sleep(2)
+        else:
+            ensure_nse_session()
 
-            records = j.get("records") or j.get("filtered")
-            if not isinstance(records, dict):
-                raise ValueError("Bad JSON: no records")
+        for url in urls:
+            try:
+                r = session.get(url, timeout=15)
+                _ensure_json_response(r, "OPTION_CHAIN")
+                j = r.json()
 
-            data = records.get("data")
-            spot = records.get("underlyingValue") or 0
-            expiry_list = records.get("expiryDates")
-            if not data or not expiry_list:
-                raise ValueError("Bad JSON: no data/expiryDates")
+                records = j.get("records") or j.get("filtered")
+                if not isinstance(records, dict):
+                    raise ValueError("Bad JSON: no records")
 
-            print("[FETCH] OC OK", url)
-            return data, round(spot), expiry_list
+                data = records.get("data")
+                spot = records.get("underlyingValue") or 0
+                expiry_list = records.get("expiryDates")
+                if not data or not expiry_list or not spot:
+                    raise ValueError("Bad JSON: no data/expiryDates/spot")
 
-        except Exception as e:
-            print("[FETCH] OC ERROR", url, ":", e)
-            last_error = e
+                print("[FETCH] OC OK", url, "spot:", spot)
+                return data, round(spot), expiry_list
+
+            except Exception as e:
+                print("[FETCH] OC ERROR", url, ":", e)
+                last_error = e
 
     raise last_error or RuntimeError("Could not fetch option chain")
 
 
 # ================== FETCH FUTURES ==================
 def fetch_futures():
-    ensure_nse_session()
     url = f"https://www.nseindia.com/api/quote-derivative?symbol={NIFTY_SYMBOL}"
-    r = session.get(url, timeout=15)
-    r.raise_for_status()
-    _ensure_json_response(r, "FUTURES")
-    j = r.json()
 
-    stocks = j.get("stocks") or []
-    futures = []
+    for attempt in range(2):
+        if attempt == 1:
+            print("[FUT] Forcing cookie refresh…")
+            ensure_nse_session(force=True)
+            time.sleep(1)
+        else:
+            ensure_nse_session()
 
-    for item in stocks:
-        meta = item.get("metadata", {})
-        if "futures" in str(meta.get("instrumentType", "")).lower():
-            exp = meta.get("expiryDate")
-            oi = meta.get("openInterest", 0)
-            chg = meta.get("changeinOpenInterest", 0)
-            if exp:
-                futures.append((exp, oi, chg))
-
-    if not futures:
-        return None
-
-    def _p(x):
         try:
-            return datetime.strptime(x, "%d-%b-%Y")
-        except Exception:
-            return datetime.max
+            r = session.get(url, timeout=15)
+            _ensure_json_response(r, "FUTURES")
+            j = r.json()
 
-    futures.sort(key=lambda x: _p(x[0]))
-    exp, oi, chg = futures[0]
-    print("[FETCH] FUT OK", exp, oi, chg)
-    return exp, oi, chg
+            stocks = j.get("stocks") or []
+            futures = []
+
+            for item in stocks:
+                meta = item.get("metadata", {})
+                if "futures" in str(meta.get("instrumentType", "")).lower():
+                    exp = meta.get("expiryDate")
+                    oi = meta.get("openInterest", 0)
+                    chg = meta.get("changeinOpenInterest", 0)
+                    if exp:
+                        futures.append((exp, oi, chg))
+
+            if not futures:
+                return None
+
+            def _p(x):
+                try:
+                    return datetime.strptime(x, "%d-%b-%Y")
+                except Exception:
+                    return datetime.max
+
+            futures.sort(key=lambda x: _p(x[0]))
+            exp, oi, chg = futures[0]
+            print("[FETCH] FUT OK", exp, oi, chg)
+            return exp, oi, chg
+
+        except Exception as e:
+            print("[FUT ERROR]", e)
+
+    return None
 
 
 # ================== FETCH LOOP ==================
 def data_fetch_loop():
     global latest_nifty, latest_fut, blocked, last_block_time
 
-    # First time: force cookie refresh
+    # first cookie refresh
     ensure_nse_session(force=True)
 
     while True:
@@ -273,11 +302,14 @@ def data_fetch_loop():
                 time.sleep(30)
                 continue
 
-            # If previously blocked, cool-down for 5 minutes
+            # backoff if blocked
             if blocked:
                 if time.time() - last_block_time < 300:
                     time.sleep(10)
                     continue
+                else:
+                    # 5 min ho gaya – try with forced refresh
+                    ensure_nse_session(force=True)
 
             try:
                 data, spot, exp_list = fetch_option_chain()
@@ -289,11 +321,13 @@ def data_fetch_loop():
             except Exception as e:
                 err = str(e).lower()
                 print("[FETCH LOOP ERROR]", e)
-                if any(x in err for x in ["403", "forbidden", "blocked", "429", "captcha", "html_blocked"]):
+                if any(x in err for x in ["403", "forbidden", "blocked", "429", "captcha", "html_blocked", "http_"]):
                     if not blocked:
                         blocked = True
                         last_block_time = time.time()
                         send("🔴 *NSE BLOCKED / ERROR!*\n\nScanner sleeping 5 minutes then retry…")
+                    else:
+                        last_block_time = time.time()
                 else:
                     time.sleep(10)
                 continue
@@ -309,7 +343,6 @@ def data_fetch_loop():
                 last_block_time = 0.0
 
             # IMPORTANT: This scanner runs with 4 more scanners.
-            # 30 sec yahan, baaki scanners me bhi similar ya thoda zyda interval rakho.
             time.sleep(30)
 
         except Exception as e:
@@ -566,14 +599,14 @@ def run_master():
                     else:
                         pos = "OTM"
 
-                    now = time.time()
+                    now_t = time.time()
 
                     # ---------- EXTREME SUPER SPIKE (TYPE B) ----------
                     if (
                         (spike >= SUPER_B["SPIKE"] and lots >= SUPER_B["LOTS"])
                         or iv_roc >= SUPER_B["IVROC"]
                     ):
-                        if now - last_B.get(key, 0) > SUPER_COOLDOWN:
+                        if now_t - last_B.get(key, 0) > SUPER_COOLDOWN:
                             side_text = (
                                 "BUYERS AGGRESSIVE" if chg_oi > 0 else "WRITERS DOMINATING"
                             )
@@ -594,14 +627,14 @@ Side: *{side_text}*{hedge_block}
 Time: `{now_ist().strftime('%H:%M:%S')}` IST
                             """.strip()
                             send(msg)
-                            last_B[key] = now
+                            last_B[key] = now_t
 
                     # ---------- SUPER SPIKE (TYPE A) ----------
                     if (
                         (spike >= SUPER_A["SPIKE"] and lots >= SUPER_A["LOTS"])
                         or iv_roc >= SUPER_A["IVROC"]
                     ):
-                        if now - last_A.get(key, 0) > SUPER_COOLDOWN:
+                        if now_t - last_A.get(key, 0) > SUPER_COOLDOWN:
                             side_text = (
                                 "BUYERS AGGRESSIVE" if chg_oi > 0 else "WRITERS ACTIVE"
                             )
@@ -622,7 +655,7 @@ Side: *{side_text}*{hedge_block}
 Time: `{now_ist().strftime('%H:%M:%S')}` IST
                             """.strip()
                             send(msg)
-                            last_A[key] = now
+                            last_A[key] = now_t
 
                     # ---------- EXTREME REVERSAL ----------
                     if (
@@ -632,7 +665,7 @@ Time: `{now_ist().strftime('%H:%M:%S')}` IST
                         and abs(iv_roc) >= REVERSAL_MIN_IVROC
                         and lots >= REVERSAL_MIN_LOTS
                     ):
-                        if now - last_R.get(key, 0) > REVERSAL_COOLDOWN:
+                        if now_t - last_R.get(key, 0) > REVERSAL_COOLDOWN:
                             if last_sign[key] > 0 and sign < 0:
                                 old_side = "BUYERS DOMINATING"
                                 new_side = "WRITERS ACTIVE"
@@ -662,7 +695,7 @@ LTP: `₹{ltp}`{hedge_block}
 Time: `{now_ist().strftime('%H:%M:%S')}` IST
                             """.strip()
                             send(msg)
-                            last_R[key] = now
+                            last_R[key] = now_t
 
                     # update history
                     prev_oi[key] = oi
