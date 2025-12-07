@@ -6,6 +6,7 @@ from datetime import datetime, time as dtime  # <-- added dtime import
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("TELEGRAM_CHAT_IDS")
 
+
 def send(msg):
     if not TOKEN or not CHAT_ID:
         print("TELEGRAM OFF:", msg[:80].replace("\n", " "))
@@ -22,8 +23,10 @@ def send(msg):
     except Exception as e:
         print("TG ERROR:", e)
 
+
 # -------------------- NSE SESSION --------------------
 s = requests.Session()
+
 BASE_HEADERS = {
     "authority": "www.nseindia.com",
     "accept": "application/json, text/plain, */*",
@@ -36,9 +39,19 @@ BASE_HEADERS = {
         "Chrome/120.0.0.0 Safari/537.36"
     ),
     "connection": "keep-alive",
+    # extra browser-like headers to reduce 403 blocks
+    "sec-fetch-site": "same-origin",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-dest": "empty",
+    "sec-ch-ua": '"Not/A)Brand";v="99", "Chromium";v="120", "Google Chrome";v="120"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "x-requested-with": "XMLHttpRequest",
 }
+
 s.headers.update(BASE_HEADERS)
 _last_cookie_refresh = 0.0
+
 
 def ensure_nse_session(force: bool = False):
     """
@@ -49,17 +62,21 @@ def ensure_nse_session(force: bool = False):
     """
     global _last_cookie_refresh
     now = time.time()
+    # normal case: reuse recent cookies
     if not force and (now - _last_cookie_refresh) < 1800:
         return
+
     try:
         r = s.get("https://www.nseindia.com", timeout=10)
         if r.status_code == 200:
             _last_cookie_refresh = now
-            print("[NSE] Session refreshed OK")
+            print("[NSE] Cookies refreshed OK")
         else:
+            # 403 here = IP / rate limit issue, scanner will still retry later
             print("[NSE] Session refresh status:", r.status_code)
     except Exception as e:
         print("[NSE] Session refresh error:", e)
+
 
 def _ensure_json_response(r, label: str):
     """
@@ -67,7 +84,7 @@ def _ensure_json_response(r, label: str):
     JSON parse se pehle check kar lein.
     """
     ct = r.headers.get("content-type", "").lower()
-    text_preview = r.text.strip().lower()[:80]
+    text_preview = r.text.strip().lower()[:120]
 
     if (
         "text/html" in ct
@@ -78,6 +95,7 @@ def _ensure_json_response(r, label: str):
 
     return r
 
+
 # -------------------- CONSTANTS --------------------
 LOT_SIZE = 75
 MIN_LOTS = 100
@@ -85,6 +103,7 @@ FILE = "data/nifty_75.json"
 os.makedirs("data", exist_ok=True)
 
 prev, sent = {}, set()
+
 
 def load_state():
     global prev, sent
@@ -96,15 +115,18 @@ def load_state():
     except Exception:
         prev, sent = {}, set()
 
+
 def save_state():
     try:
         json.dump({"prev": prev, "sent": list(sent)}, open(FILE, "w"))
     except Exception as e:
         print("SAVE ERROR:", e)
 
+
 # -------------------- SINGLE SCAN RUN --------------------
 def scan_once():
     global prev, sent
+
     try:
         ensure_nse_session()
         urls = [
@@ -113,26 +135,50 @@ def scan_once():
         ]
         records = None
 
-        for url in urls:
-            try:
-                r = s.get(url, timeout=15)
-                r.raise_for_status()
-                _ensure_json_response(r, "OPTION_CHAIN")
-                j = r.json()
-                records = j.get("records") or j.get("filtered")
-                if records:
+        # 2 attempts: second attempt forces cookie refresh if first one fails / blocked
+        for attempt in range(2):
+            if attempt == 1 and records is None:
+                print("[NSE] Forcing cookie refresh after failure...")
+                ensure_nse_session(force=True)
+                time.sleep(2)
+
+            for url in urls:
+                try:
+                    r = s.get(url, timeout=15)
+
+                    # handle hard blocks
+                    if r.status_code in (401, 403, 429, 500):
+                        print(f"[NSE] API status {r.status_code} for", url)
+                        continue
+
+                    _ensure_json_response(r, "OPTION_CHAIN")
+                    j = r.json()
+                    records = j.get("records") or j.get("filtered")
+                    if records:
+                        break
+
+                except RuntimeError as e:
+                    # HTML_BLOCKED -> most likely captcha page
+                    print("[SCAN FETCH ERROR]", url, ":", e)
+                    # break inner loop, outer attempt will refresh session
                     break
-            except Exception as e:
-                print("[SCAN FETCH ERROR]", url, ":", e)
+                except Exception as e:
+                    print("[SCAN FETCH ERROR]", url, ":", e)
+
+            if records:
+                break
 
         if not records:
+            # nothing usable this cycle
             return
 
         data = records
+
     except Exception as e:
         print("[SCAN ONCE ERROR]", e)
         return
 
+    # --------- parse top-level header ----------
     try:
         spot = int(data["underlyingValue"])
         exp = datetime.strptime(
@@ -145,6 +191,7 @@ def scan_once():
     atm = int(round(spot / 50) * 50)
     alerts = []
 
+    # --------- walk strikes ----------
     for item in data.get("data", []):
         strike = item.get("strikePrice")
         if strike is None or abs(strike - atm) > 800:
@@ -185,28 +232,32 @@ def scan_once():
         if key_pe in prev:
             lots = (pe_oi - prev[key_pe]["oi"]) // LOT_SIZE
             if lots >= MIN_LOTS and key_pe not in sent:
-                alerts.append(f"""Green Circle <b>NIFTY {strike} {tag}</b> Green Circle
+                alerts.append(
+                    f"""Green Circle <b>NIFTY {strike} {tag}</b> Green Circle
 {exp} │ Spot: <b>{spot}</b>
 
 <b>LTP CE:</b> {ce_ltp:.0f} │ <b>LTP PE:</b> {pe_ltp:.0f}
 <b>IV CE:</b> {ce_iv} ({ce_roc:+.1f}%) │ <b>IV PE:</b> {pe_iv} ({pe_roc:+.1f}%)
 <b>OI +{lots} Lots (PE)</b> → <b>BUYERS BLAST</b>
 
-<i>Time:</i> {now_str}""")
+<i>Time:</i> {now_str}"""
+                )
                 sent.add(key_pe)
 
         # CE BLAST
         if key_ce in prev:
             lots = (ce_oi - prev[key_ce]["oi"]) // LOT_SIZE
             if lots >= MIN_LOTS and key_ce not in sent:
-                alerts.append(f"""Red Circle <b>NIFTY {strike} {tag}</b> Red Circle
+                alerts.append(
+                    f"""Red Circle <b>NIFTY {strike} {tag}</b> Red Circle
 {exp} │ Spot: <b>{spot}</b>
 
 <b>LTP CE:</b> {ce_ltp:.0f} │ <b>LTP PE:</b> {pe_ltp:.0f}
 <b>IV CE:</b> {ce_iv} ({ce_roc:+.1f}%) │ <b>IV PE:</b> {pe_iv} ({pe_roc:+.1f}%)
 <b>OI +{lots} Lots (CE)</b> → <b>WRITERS ACTIVE</b>
 
-<i>Time:</i> {now_str}""")
+<i>Time:</i> {now_str}"""
+                )
                 sent.add(key_ce)
 
         # Update prev
@@ -222,6 +273,7 @@ def scan_once():
 
     save_state()
 
+
 # -------------------- THREAD SAFE RUNNER --------------------
 def run_nifty_scanner():
     load_state()
@@ -234,8 +286,7 @@ def run_nifty_scanner():
         now = datetime.now(pytz.timezone("Asia/Kolkata"))
         t = now.time()
 
-        # 🔴 Pehle: if 9 <= h <= 15
-        # ✅ Ab: sirf market ke dauran (9:15 se 15:30)
+        # sirf market ke dauran (9:15 se 15:30)
         if dtime(9, 15) <= t <= dtime(15, 30):
             scan_once()
 
