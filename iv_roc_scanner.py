@@ -18,10 +18,10 @@ def send(msg):
                 json={"chat_id": cid, "text": msg, "parse_mode": "HTML"},
                 timeout=8,
             )
-    except:
-        pass
+    except Exception as e:
+        print("TG ERROR:", e)
 
-# -------------------- NSE SESSION (STRONG) --------------------
+# -------------------- NSE SESSION (STRONG FULL HEADERS) --------------------
 s = requests.Session()
 BASE_HEADERS = {
     "authority": "www.nseindia.com",
@@ -34,8 +34,19 @@ BASE_HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/120.0.0.0 Safari/537.36"
     ),
+    "connection": "keep-alive",
+
+    # 🔥 additional required headers
+    "x-requested-with": "XMLHttpRequest",
+    "sec-fetch-site": "same-origin",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-dest": "empty",
+    "sec-ch-ua": '"Chromium";v="120", "Google Chrome";v="120", "Not=A?Brand";v="99"',
+    "sec-ch-ua-platform": '"Windows"',
+    "sec-ch-ua-mobile": "?0",
 }
 s.headers.update(BASE_HEADERS)
+
 _last_refresh = 0
 
 def ensure_nse_session(force=False):
@@ -45,18 +56,26 @@ def ensure_nse_session(force=False):
     if not force and (now - _last_refresh) < 1800:
         return
     try:
-        s.get("https://www.nseindia.com", timeout=10)
+        r = s.get("https://www.nseindia.com", timeout=10)
+        if r.status_code == 200:
+            print("[NSE] Cookies refreshed")
+        else:
+            print("[NSE] Refresh status:", r.status_code)
         _last_refresh = now
-        print("[NSE] Cookies refreshed OK")
     except Exception as e:
         print("[NSE] Cookie refresh error:", e)
 
 def ensure_json(r, label):
-    """Detect HTML-blocked responses."""
+    """Detect HTML-blocked or NSE-blocked responses BEFORE .json()."""
+    if r.status_code in (401,403,429,500):
+        raise RuntimeError(f"{label}: HTTP_BLOCK_{r.status_code}")
+
     ct = r.headers.get("content-type", "").lower()
     t = r.text.strip().lower()
+
     if "html" in ct or t.startswith("<!doctype html") or t.startswith("<html"):
         raise RuntimeError(f"{label}: HTML_BLOCKED")
+
     return r
 
 # -------------------- CONSTANTS --------------------
@@ -66,7 +85,6 @@ RANGE = 800
 FILE = "data/nifty_75_100plus.json"
 
 os.makedirs("data", exist_ok=True)
-
 prev, sent = {}, set()
 
 def load_state():
@@ -85,41 +103,48 @@ def save_state():
     except:
         pass
 
-# -------------------- SCANNER CORE --------------------
-def scan_once():
-    global prev, sent
-    try:
-        ensure_nse_session()
-        urls = [
-            "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY",
-            "https://www.nseindia.com/api/option-chain-v3?type=Indices&symbol=NIFTY",
-        ]
-        rec = None
+# -------------------- FETCH OI DATA (Stable) --------------------
+def fetch_option_chain():
+    """Return option-chain JSON safely with retry + fallback."""
+    urls = [
+        "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY",
+        "https://www.nseindia.com/api/option-chain-v3?type=Indices&symbol=NIFTY",
+    ]
+
+    # Two rounds → second round forces cookie refresh
+    for attempt in range(2):
+        if attempt == 1:
+            print("[NSE] Forcing cookie refresh (round 2)")
+            ensure_nse_session(force=True)
+            time.sleep(2)
 
         for u in urls:
             try:
                 r = s.get(u, timeout=12)
-                r.raise_for_status()
-                ensure_json(r, "OPTION_CHAIN")
+                r = ensure_json(r, "OPTION_CHAIN")
                 j = r.json()
-                rec = j.get("records") or j.get("filtered")
-                if rec:
-                    break
+                return j.get("records") or j.get("filtered") or None
+
             except Exception as e:
-                print("[FETCH ERROR]", e)
+                print("[CHAIN ERROR]", u, ":", e)
 
-        if not rec:
-            return
-        data = rec
+    return None
 
-    except Exception as e:
-        print("[SCAN ERROR]", e)
+# -------------------- SCANNER CORE --------------------
+def scan_once():
+    global prev, sent
+
+    ensure_nse_session()
+
+    data = fetch_option_chain()
+    if not data:
         return
 
     try:
         spot = int(data["underlyingValue"])
         exp = datetime.strptime(data["expiryDates"][0], "%d-%b-%Y").strftime("%d-%b-%Y")
-    except:
+    except Exception as e:
+        print("[PARSE ERROR]", e)
         return
 
     atm = int(round(spot / 50) * 50)
@@ -204,7 +229,7 @@ def run_iv_roc_scanner():
     while True:
         now = datetime.now(pytz.timezone("Asia/Kolkata")).time()
 
-        # 🔥 updated — only run between 9:15 and 15:30
+        # 🔥 only run between 9:15 and 15:30
         if dtime(9, 15) <= now <= dtime(15, 30):
             scan_once()
 
