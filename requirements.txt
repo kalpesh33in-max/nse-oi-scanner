@@ -1,4 +1,6 @@
-requests
-pytz
 flask
+requests
+pandas
+numpy
+beautifulsoup4
 gunicorn
