@@ -34,6 +34,15 @@ def run_kalpe_super_scanner():
             "Chrome/120.0.0.0 Safari/537.36"
         ),
         "connection": "keep-alive",
+
+        # extra headers to look more like a real browser
+        "sec-fetch-site": "same-origin",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-dest": "empty",
+        "sec-ch-ua": '"Not/A)Brand";v="99", "Chromium";v="120", "Google Chrome";v="120"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "x-requested-with": "XMLHttpRequest",
     }
     session.headers.update(BASE_HEADERS)
     _last_cookie_refresh = 0.0
@@ -66,7 +75,7 @@ def run_kalpe_super_scanner():
         JSON parse se pehle check kar lein.
         """
         ct = r.headers.get("content-type", "").lower()
-        text_preview = r.text[:80].strip().lower()
+        text_preview = r.text[:120].strip().lower()
 
         if (
             "text/html" in ct
@@ -116,6 +125,12 @@ def run_kalpe_super_scanner():
             ensure_nse_session()
             url = "https://www.nseindia.com/api/quote-derivative?symbol=NIFTY"
             r = session.get(url, timeout=10)
+
+            # handle hard NSE blocks
+            if r.status_code in (401, 403, 429, 500):
+                print("[FUTURE BLOCK]", r.status_code)
+                return False
+
             r.raise_for_status()
             _ensure_json_response(r, "FUTURES")
 
@@ -254,11 +269,12 @@ def run_kalpe_super_scanner():
         return "Neutral", "No clear bias"
 
     # --------------------------
-    # FETCH OPTION-CHAIN
+    # FETCH OPTION-CHAIN (with retry + block handling)
     # --------------------------
     def fetch_data():
         nonlocal latest, blocked, last_block_time
 
+        # if already blocked, back off for 60 seconds
         if blocked and (time.time() - last_block_time) < 60:
             return False
 
@@ -267,43 +283,67 @@ def run_kalpe_super_scanner():
             "https://www.nseindia.com/api/option-chain-v3?type=Indices&symbol=NIFTY"
         ]
 
-        for url in urls:
-            try:
-                ensure_nse_session()
-                r = session.get(url, timeout=15)
-                r.raise_for_status()
-                _ensure_json_response(r, "OPTION_CHAIN")
+        got_records = False
 
-                j = r.json()
-                records = j.get("records") or j.get("filtered") or {}
-                data = records.get("data") or []
-                spot = round(records.get("underlyingValue") or 0)
+        # 2 attempts: second attempt forces new cookies
+        for attempt in range(2):
+            if attempt == 1 and not got_records:
+                print("[NSE] Forcing cookie refresh in fetch_data()...")
+                ensure_nse_session(force=True)
+                time.sleep(2)
 
-                if data and spot > 15000:
-                    with lock:
-                        latest = (data, spot, time.time())
+            for url in urls:
+                try:
+                    r = session.get(url, timeout=15)
 
-                    if blocked:
-                        send("🟢 *NSE Unblocked — Scanner Resumed*")
-                        blocked = False
-                        last_block_time = 0
-                    print("[OC] OK", url, "spot:", spot)
-                    return True
+                    # handle hard NSE API blocks
+                    if r.status_code in (401, 403, 429, 500):
+                        print("[FETCH STATUS BLOCK]", url, ":", r.status_code)
+                        continue
 
-            except Exception as e:
-                err = str(e).lower()
-                print("FETCH ERROR:", url, ":", e)
+                    r.raise_for_status()
+                    _ensure_json_response(r, "OPTION_CHAIN")
 
-                if any(t in err for t in ["403", "429", "blocked", "captcha", "html_blocked"]):
-                    if not blocked:
-                        blocked = True
-                        last_block_time = time.time()
-                        send("🔴 *Scanner Blocked — Retrying every 1 min*")
-                    else:
-                        last_block_time = time.time()
-                # try next url
+                    j = r.json()
+                    records = j.get("records") or j.get("filtered") or {}
+                    data = records.get("data") or []
+                    spot = round(records.get("underlyingValue") or 0)
 
-        return False
+                    if data and spot > 15000:
+                        with lock:
+                            latest = (data, spot, time.time())
+
+                        if blocked:
+                            send("🟢 *NSE Unblocked — Scanner Resumed*")
+                            blocked = False
+                            last_block_time = 0
+
+                        print("[OC] OK", url, "spot:", spot)
+                        got_records = True
+                        break
+
+                except RuntimeError as e:
+                    # HTML_BLOCKED etc
+                    print("FETCH ERROR (HTML/BLOCK):", url, ":", e)
+                except Exception as e:
+                    print("FETCH ERROR:", url, ":", e)
+
+            if got_records:
+                break
+
+        # if still nothing, mark as blocked
+        if not got_records:
+            err_msg = "UNKNOWN_BLOCK"
+            if not blocked:
+                blocked = True
+                last_block_time = time.time()
+                send("🔴 *Scanner Blocked — Retrying every 1 min*")
+            else:
+                last_block_time = time.time()
+            print("[FETCH_DATA] No usable option chain, marking blocked:", err_msg)
+            return False
+
+        return True
 
     # --------------------------
     # FETCH LOOP
@@ -316,7 +356,6 @@ def run_kalpe_super_scanner():
                 fetch_data()
                 fetch_nifty_future_auto()
                 # IMPORTANT: This scanner runs with 4 more scanners.
-                # 30 sec yahan, baaki scanners me bhi similar ya thoda zyda interval rakho.
                 time.sleep(30)
             else:
                 time.sleep(60)
