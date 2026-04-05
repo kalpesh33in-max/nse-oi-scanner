@@ -11,8 +11,9 @@ load_dotenv()
 API_ID = int(os.getenv("TG_API_ID"))
 API_HASH = os.getenv("TG_API_HASH")
 SESSION_STR = os.getenv("TG_SESSION_STR")
-SOURCE_IDS = [int(i.strip()) for i in os.getenv("SOURCE_BOT").split(",")]
-TARGET_BOT_ID = int(os.getenv("TARGET_BOT")) 
+SOURCE_BOT_RAW = os.getenv("SOURCE_BOT", "")
+SOURCE_IDS = [int(i.strip()) for i in SOURCE_BOT_RAW.split(",") if i.strip()]
+TARGET_BOT_ID = int(os.getenv("TARGET_BOT", 0)) 
 
 async def main():
     # Using StringSession exactly like your dashboard scanner
