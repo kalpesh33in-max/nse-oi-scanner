@@ -13,11 +13,11 @@ def get_future_price(text):
     match = re.search(r"BANKNIFTY \(FUT:\s*([\d.]+)\)", text)
     return float(match.group(1)) if match else None
 
-def check_component_bias(text, component_name):
-    # Checks if a specific bank is "STRONG BULLISH" or "VERY STRONG BULLISH"
+def check_component_bias(text, component_name, status="STRONG BULLISH"):
+    # Checks if a specific bank matches the status
     try:
         section = text.split(f"💎 {component_name}")[1].split("=")[0]
-        return "STRONG BULLISH" in section
+        return status in section
     except:
         return False
 
@@ -27,11 +27,23 @@ def parse_15m_data(text):
     data['bull_turn'] = get_value("Bullish Turn", text)
     data['bear_turn'] = get_value("Bearish Turn", text)
     
-    # Extract Put Writing ITM value (using your dashboard's logic)
+    # Extract Put & Call Writing ITM value (using your dashboard's logic)
     put_wr_matches = re.findall(r"PUT_WR\s+\d+\(([\d.]+)(Cr|L)\)", text)
     data['put_wr_cr'] = (float(put_wr_matches[0][0]) if put_wr_matches[0][1] == "Cr" else float(put_wr_matches[0][0])/100) if put_wr_matches else 0.0
+
+    call_wr_matches = re.findall(r"CALL_WR\s+\d+\(([\d.]+)(Cr|L)\)", text)
+    data['call_wr_cr'] = (float(call_wr_matches[0][0]) if call_wr_matches[0][1] == "Cr" else float(call_wr_matches[0][0])/100) if call_wr_matches else 0.0
     
-    data['hdfc_bull'] = check_component_bias(text, "HDFCBANK")
-    data['icici_bull'] = check_component_bias(text, "ICICIBANK")
+    # Bank Bullish Status
+    data['hdfc_bull'] = check_component_bias(text, "HDFCBANK", "STRONG BULLISH")
+    data['icici_bull'] = check_component_bias(text, "ICICIBANK", "STRONG BULLISH")
+    data['sbin_bull'] = check_component_bias(text, "SBIN", "STRONG BULLISH")
+    data['axis_bull'] = check_component_bias(text, "AXISBANK", "STRONG BULLISH")
+
+    # Bank Bearish Status
+    data['hdfc_bear'] = check_component_bias(text, "HDFCBANK", "STRONG BEARISH")
+    data['icici_bear'] = check_component_bias(text, "ICICIBANK", "STRONG BEARISH")
+    data['sbin_bear'] = check_component_bias(text, "SBIN", "STRONG BEARISH")
+    data['axis_bear'] = check_component_bias(text, "AXISBANK", "STRONG BEARISH")
     
     return data
