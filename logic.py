@@ -19,28 +19,26 @@ def get_confirmation(current):
     bear_banks = [current['hdfc_bear'], current['icici_bear'], current['sbin_bear'], current['axis_bear']].count(True)
 
     # 1. BULLISH BREAKOUT CONFIRMATION
-    # Price moved <0.1%, but Bullish Turn jumped >30 Crores, and at least 2 banks are bullish.
     if price_delta < 0.001 and bull_delta > 30.0 and bull_banks >= 2:
         last_snap = current
-        return "🚀 **15M BULLISH BREAKOUT CONFIRMED** 🚀\n\nSmart Money adding massive Longs while Price is Flat.\n🔥 Bullish Turn Delta: +{:.1f}Cr\n🏦 Strong Banks: {}/4".format(bull_delta, bull_banks)
+        return "🟢 🚀 **15M BULLISH BREAKOUT CONFIRMED** 🟢\n\nSmart Money adding massive Longs while Price is Flat.\n🟢 🔥 Bullish Turn Delta: +{:.1f}Cr\n🏦 Strong Banks: {}/4".format(bull_delta, bull_banks)
 
     # 2. BEARISH BREAKDOWN CONFIRMATION
-    # Price moved <0.1%, but Bearish Turn jumped >30 Crores, and at least 2 banks are bearish.
     if price_delta < 0.001 and bear_delta > 30.0 and bear_banks >= 2:
         last_snap = current
-        return "📉 **15M BEARISH BREAKDOWN CONFIRMED** 📉\n\nSmart Money adding massive Shorts while Price is Flat.\n🔥 Bearish Turn Delta: +{:.1f}Cr\n🏦 Weak Banks: {}/4".format(bear_delta, bear_banks)
+        return "🔴 📉 **15M BEARISH BREAKDOWN CONFIRMED** 🔴\n\nSmart Money adding massive Shorts while Price is Flat.\n🔴 🔥 Bearish Turn Delta: +{:.1f}Cr\n🏦 Weak Banks: {}/4".format(bear_delta, bear_banks)
 
-    # 3. SUPPORT CONFIRMATION (Price falling, but massive Put Writing)
+    # 3. SUPPORT CONFIRMATION (Bullish Support)
     if current['price'] < last_snap['price'] and current['put_wr_cr'] > (last_snap['put_wr_cr'] + 15.0):
         last_snap = current
-        return "🛡️ **15M SUPPORT CONFIRMED** 🛡️\n\nPrice dropped, but massive NEW Put Writing defending current zone.\nSupport is strong here (+{:.1f}Cr Put Writing)".format(current['put_wr_cr'] - last_snap['put_wr_cr'])
+        return "🟢 🛡️ **15M SUPPORT CONFIRMED** 🟢\n\nPrice dropped, but massive NEW Put Writing defending current zone.\n🟢 🛡️ Support is strong here (+{:.1f}Cr Put Writing)".format(current['put_wr_cr'] - last_snap['put_wr_cr'])
 
-    # 4. RESISTANCE CONFIRMATION (Price rising, but massive Call Writing)
+    # 4. RESISTANCE CONFIRMATION (Bearish Resistance)
     if current['price'] > last_snap['price'] and current['call_wr_cr'] > (last_snap['call_wr_cr'] + 15.0):
         last_snap = current
-        return "🧱 **15M RESISTANCE CONFIRMED** 🧱\n\nPrice rose, but massive NEW Call Writing capping the upside.\nResistance is strong here (+{:.1f}Cr Call Writing)".format(current['call_wr_cr'] - last_snap['call_wr_cr'])
+        return "🔴 🧱 **15M RESISTANCE CONFIRMED** 🔴\n\nPrice rose, but massive NEW Call Writing capping the upside.\n🔴 🧱 Resistance is strong here (+{:.1f}Cr Call Writing)".format(current['call_wr_cr'] - last_snap['call_wr_cr'])
 
-    # 5. CONSOLIDATION ALERT (Delta in turns is small)
+    # 5. CONSOLIDATION ALERT (Neutral)
     turn_diff = abs(current['bull_turn'] - current['bear_turn'])
     if turn_diff < 10.0 and price_delta < 0.001:
         last_snap = current
