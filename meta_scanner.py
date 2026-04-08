@@ -27,7 +27,7 @@ async def main():
         text = event.message.text
         
         # We only care about 15 MIN or 30 MIN messages for this scanner
-        if "15 MIN" not in text and "30 MIN" not in text:
+        if "CUMULATIVE FLOW" not in text.upper():
             return
 
         try:
