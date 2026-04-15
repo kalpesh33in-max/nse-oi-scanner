@@ -52,14 +52,19 @@ def get_future_component(text, type_list):
     return total
 
 
+def get_option_bias_line(section):
+    match = re.search(r"Option Bias:\s*([^\n\r]+)", section, re.IGNORECASE)
+    return match.group(1).upper() if match else ""
+
+
 def has_bullish_bias(section):
-    upper = section.upper()
-    return "BULLISH" in upper and "BEARISH" not in upper
+    option_bias = get_option_bias_line(section)
+    return "BULLISH" in option_bias and "BEARISH" not in option_bias
 
 
 def has_bearish_bias(section):
-    upper = section.upper()
-    return "BEARISH" in upper and "BULLISH" not in upper
+    option_bias = get_option_bias_line(section)
+    return "BEARISH" in option_bias and "BULLISH" not in option_bias
 
 
 def parse_15m_data(text):

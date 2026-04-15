@@ -30,14 +30,34 @@ def build_trade_block(current_data, alert_message):
     if not atm or not alert_message:
         return ""
 
-    if "BULLISH BREAKOUT" in alert_message or "SUPPORT CONFIRMED" in alert_message:
+    if "BULLISH BREAKOUT" in alert_message:
         side = "BUY ATM CE"
         symbol = f"BANKNIFTY {atm} CE"
         sl = "Below alert candle low on underlying"
-    elif "BEARISH BREAKDOWN" in alert_message or "RESISTANCE CONFIRMED" in alert_message:
+        entry = "Near alert trigger, avoid chasing premium spike"
+        target = "Partial at 1:1.5 RR, trail/exit at 1:2 RR or opposite alert"
+        avoid = "Skip if consolidation appears or next 1-2 candles show no follow-through"
+    elif "SUPPORT CONFIRMED" in alert_message:
+        side = "BUY ATM CE"
+        symbol = f"BANKNIFTY {atm} CE"
+        sl = "Below recent swing low on underlying"
+        entry = "Near support confirmation, avoid late entry after sharp bounce"
+        target = "Partial at 1:1.5 RR, trail on strength"
+        avoid = "Skip if put writing fades in next report"
+    elif "BEARISH BREAKDOWN" in alert_message:
         side = "BUY ATM PE"
         symbol = f"BANKNIFTY {atm} PE"
         sl = "Above alert candle high on underlying"
+        entry = "Near alert trigger, avoid chasing premium spike"
+        target = "Partial at 1:1.5 RR, trail/exit at 1:2 RR or opposite alert"
+        avoid = "Skip if consolidation appears or next 1-2 candles show no follow-through"
+    elif "RESISTANCE CONFIRMED" in alert_message:
+        side = "BUY ATM PE"
+        symbol = f"BANKNIFTY {atm} PE"
+        sl = "Above recent swing high on underlying"
+        entry = "Near resistance confirmation, avoid late entry after sharp drop in premium"
+        target = "Partial at 1:1.5 RR, trail on weakness"
+        avoid = "Skip if call writing fades in next report"
     else:
         return ""
 
@@ -47,10 +67,10 @@ def build_trade_block(current_data, alert_message):
         f"ATM Strike: {atm}\n"
         f"Suggested Symbol: {symbol}\n"
         f"Reference Price: {price:.2f}\n"
-        "Entry Zone: Near alert trigger, avoid chasing premium spike\n"
+        f"Entry Zone: {entry}\n"
         f"Stop Loss: {sl}\n"
-        "Target: Partial at 1:1.5 RR, trail/exit at 1:2 RR or opposite alert\n"
-        "Avoid: Skip if consolidation appears or next 1-2 candles show no follow-through"
+        f"Target: {target}\n"
+        f"Avoid: {avoid}"
     )
 
 

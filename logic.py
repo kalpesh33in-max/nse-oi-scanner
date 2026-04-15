@@ -183,23 +183,27 @@ def get_confirmation(current, return_debug=False, trade_day=None):
 
     if current["price"] < last_snap["price"] and current["put_wr_cr"] > (last_snap["put_wr_cr"] + 7.0):
         support_delta = current["put_wr_cr"] - last_snap["put_wr_cr"]
+        price_change = current["price"] - last_snap["price"]
         last_snap = current
         debug["reason"] = "support_confirmed"
         message = (
             "15M SUPPORT CONFIRMED\n\n"
-            "Price dropped, but NEW Put Writing defending current zone.\n"
-            f"Support Delta: +{support_delta:.1f}Cr (Put Writing)"
+            "Price dipped but fresh Put Writing emerged.\n"
+            f"PUT_WR Delta: +{support_delta:.1f}Cr\n"
+            f"Price Change: {price_change:+.1f} pts"
         )
         return (message, debug) if return_debug else message
 
     if current["price"] > last_snap["price"] and current["call_wr_cr"] > (last_snap["call_wr_cr"] + 7.0):
         res_delta = current["call_wr_cr"] - last_snap["call_wr_cr"]
+        price_change = current["price"] - last_snap["price"]
         last_snap = current
         debug["reason"] = "resistance_confirmed"
         message = (
             "15M RESISTANCE CONFIRMED\n\n"
-            "Price rose, but NEW Call Writing capping the upside.\n"
-            f"Resistance Delta: +{res_delta:.1f}Cr (Call Writing)"
+            "Price rose but fresh Call Writing emerged.\n"
+            f"CALL_WR Delta: +{res_delta:.1f}Cr\n"
+            f"Price Change: {price_change:+.1f} pts"
         )
         return (message, debug) if return_debug else message
 
@@ -211,8 +215,11 @@ def get_confirmation(current, return_debug=False, trade_day=None):
         debug["reason"] = "consolidation_alert"
         message = (
             "15M CONSOLIDATION ALERT\n\n"
-            "Range-bound fighting between Call & Put sellers.\n"
-            "Avoid aggressive breakouts right now."
+            "Both sides are balanced.\n"
+            f"Bull-Bear Difference: {turn_diff:.1f}Cr\n"
+            f"Price Change: {price_delta * 100:.2f}%\n\n"
+            "No directional trade yet.\n"
+            "Wait for fresh breakout, breakdown, support, or resistance confirmation."
         )
         return (message, debug) if return_debug else message
 
